@@ -1,0 +1,19 @@
+[package]
+name = "sparse-linear-algebra-tests"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pathmap_sla"
+path = "src/main.rs"
+
+[dependencies]
+num-traits = "0.2.19"
+pathmap = { path = "../PathMap" }
+rand_distr = { version = "0.5.1" }
+rand = { version = "0.9.0" }
+blas = "0.23.0"
+blas-src = { version="0.14.0", features = ["openblas"] }
+
+[features]
+viz = []
