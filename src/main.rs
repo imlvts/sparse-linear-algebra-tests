@@ -81,7 +81,10 @@ fn tipover_attention_bob() {
     let mut rtrb = DenseTensorFBlas::new(vec![batch_size, sequence_length, n_heads, n_heads]);
     rtq.attention(&rtk, &mut rtrb);
     println!("blas {} µs ({n_weights} weights)", t0.elapsed().as_micros());
-
+    println!("estimated memory usage: {} / {} / {} bytes",
+        rtq.estimate_memory_usage(),
+        rtk.estimate_memory_usage(),
+        rtr.estimate_memory_usage());
     // verify correctness of BLAS against reference
     for b in 0..batch_size {
         for h in 0..sequence_length {
@@ -154,6 +157,10 @@ fn tipover_attention_bob() {
     // bob_attention(&mut rtq.m.read_zipper(), &mut rtk.m.read_zipper(), &mut rtr.m.write_zipper(), 0);
     println!("bob {} µs ({n_weights} weights, {q_nz} Q nz, {k_nz} K nz)", t0.elapsed().as_micros());
     println!("count {}", unsafe{ COUNT });
+    println!("estimated memory usage: {} / {} / {} bytes",
+        rtq.estimate_memory_usage(),
+        rtk.estimate_memory_usage(),
+        rtr.estimate_memory_usage());
 }
 
 fn tipover_attention_weave(density: f64) {
@@ -181,6 +188,10 @@ fn tipover_attention_weave(density: f64) {
     // reference_attention(&rtq, &rtk, &mut rtr);
     println!("ref {} µs ({n_weights} weights)", t0.elapsed().as_micros());
     println!("rcount {}", unsafe{ RCOUNT });
+    println!("estimated memory usage: {} / {} / {} bytes",
+        rtq.estimate_memory_usage(),
+        rtk.estimate_memory_usage(),
+        rtr.estimate_memory_usage());
 
     // Copy dense solution into sparse
     let mut rtr_ = SparseTensorFWeave::new(4);
@@ -214,6 +225,7 @@ fn tipover_attention_weave(density: f64) {
     let mut rtr = SparseTensorFWeave::new(4);
     let q_nz = rtq.m.val_count();
     let k_nz = rtk.m.val_count();
+    println!("weave density {}%: {q_nz} Q nz, {k_nz} K nz", density*100.0);
     // rtq.vF_mut().merkleize();
     // rtk.vF_mut().merkleize();
     let t0 = Instant::now();
@@ -222,6 +234,10 @@ fn tipover_attention_weave(density: f64) {
     // _short_weave_attention(&mut rtq.m.read_zipper(), &mut rtk.m.read_zipper(), &mut rtr.m.write_zipper());
     println!("weave {} µs ({n_weights} weights, {q_nz} Q nz, {k_nz} K nz)", t0.elapsed().as_micros());
     println!("count {}", unsafe{ COUNT });
+    println!("estimated memory usage: {} / {} / {} bytes",
+        rtq.estimate_memory_usage(),
+        rtk.estimate_memory_usage(),
+        rtr.estimate_memory_usage());
 }
 
 

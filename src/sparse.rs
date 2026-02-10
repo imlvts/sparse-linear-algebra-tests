@@ -84,7 +84,11 @@ impl SparseTensorFBOB {
     pub fn new(dimensions: usize) -> Self { 
         Self { m: PathMap::new(), d: dimensions, p: Vec::new() } 
     }
-    
+
+    pub fn estimate_memory_usage(&self) -> usize {
+        self.m.estimate_memory_usage()
+    }
+
     fn index_to_path(&self, ix: &[usize]) -> Vec<u8> {
         let mut p = Vec::new();
         let len = indices_to_bob(ix, &mut vec![]);
@@ -205,7 +209,6 @@ impl SparseTensorFWeave {
         assert_eq!(self.p.len(), 8);
         self.m.insert(&self.p[..], v);
     }
-
     pub fn add(&self, other: &Self) -> Self { 
         Self::vf32(self.vf().join(other.vf()), self.d) 
     }
@@ -230,7 +233,10 @@ impl SparseTensorFWeave {
     pub fn new(dimensions: usize) -> Self { 
         Self { m: PathMap::new(), d: dimensions, p: Vec::new() } 
     }
-    
+    pub fn estimate_memory_usage(&self) -> usize {
+        self.m.estimate_memory_usage()
+    }
+
     fn index_to_path(&self, ix: &[usize]) -> Vec<u8> {
         let mut p = Vec::new();
         indices_to_weave::<2, u16>(ix, &mut p);

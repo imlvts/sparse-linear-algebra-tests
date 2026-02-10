@@ -163,7 +163,12 @@ impl<S: AttentionStrategy + Default> DenseTensorFRef<S> {
         let n: usize = d.iter().product();
         Self { m: vec![0.0; n], d, _strategy: S::default() }
     }
-
+    pub fn size(&self) -> usize {
+        self.m.len()
+    }
+    pub fn estimate_memory_usage(&self) -> usize {
+        self.m.len() * core::mem::size_of::<f32>()
+    }
     pub fn to_strategy<S2: AttentionStrategy>(self, strategy: S2) -> DenseTensorFRef<S2> {
         DenseTensorFRef { m: self.m, d: self.d, _strategy: strategy }
     }
