@@ -377,45 +377,48 @@ impl CsrMatrix {
         Self { n, row_ptr, col_idx, values }
     }
 
-    /// Parallel matrix multiply using rayon. Each row computed independently
-    /// with its own dense accumulator, then stitched together.
+    /// Parallel matrix multiply using rayon. Each rayon task reuses a dense
+    /// accumulator across all rows it processes (via `map_init`).
     pub fn matmul_par(&self, other: &Self) -> Self {
         assert_eq!(self.n, other.n);
         let n = self.n;
 
-        // Compute each row independently in parallel
-        let rows: Vec<(Vec<usize>, Vec<u64>)> = (0..n).into_par_iter().map(|i| {
-            let mut acc = vec![0u64; n];
-            let mut nz_cols: Vec<usize> = Vec::new();
-
-            let a_start = self.row_ptr[i];
-            let a_end = self.row_ptr[i + 1];
-            for idx in a_start..a_end {
-                let k = self.col_idx[idx];
-                let a_ik = self.values[idx];
-                let b_start = other.row_ptr[k];
-                let b_end = other.row_ptr[k + 1];
-                for jdx in b_start..b_end {
-                    let j = other.col_idx[jdx];
-                    if acc[j] == 0 {
-                        nz_cols.push(j);
+        let rows: Vec<(Vec<usize>, Vec<u64>)> = (0..n).into_par_iter()
+            .map_init(
+                || (vec![0u64; n], Vec::<usize>::new()),
+                |(acc, nz_cols), i| {
+                    let a_start = self.row_ptr[i];
+                    let a_end = self.row_ptr[i + 1];
+                    for idx in a_start..a_end {
+                        let k = self.col_idx[idx];
+                        let a_ik = self.values[idx];
+                        let b_start = other.row_ptr[k];
+                        let b_end = other.row_ptr[k + 1];
+                        for jdx in b_start..b_end {
+                            let j = other.col_idx[jdx];
+                            if acc[j] == 0 {
+                                nz_cols.push(j);
+                            }
+                            acc[j] = sadd(acc[j], smul(a_ik, other.values[jdx]));
+                        }
                     }
-                    acc[j] = sadd(acc[j], smul(a_ik, other.values[jdx]));
-                }
-            }
 
-            nz_cols.sort_unstable();
-            let mut cols = Vec::with_capacity(nz_cols.len());
-            let mut vals = Vec::with_capacity(nz_cols.len());
-            for &j in &nz_cols {
-                let v = acc[j];
-                if v != 0 {
-                    cols.push(j);
-                    vals.push(v);
-                }
-            }
-            (cols, vals)
-        }).collect();
+                    nz_cols.sort_unstable();
+                    let mut cols = Vec::with_capacity(nz_cols.len());
+                    let mut vals = Vec::with_capacity(nz_cols.len());
+                    for &j in nz_cols.iter() {
+                        let v = acc[j];
+                        if v != 0 {
+                            cols.push(j);
+                            vals.push(v);
+                        }
+                        acc[j] = 0;
+                    }
+                    nz_cols.clear();
+                    (cols, vals)
+                },
+            )
+            .collect();
 
         // Stitch rows into CSR
         let total_nnz: usize = rows.iter().map(|(c, _)| c.len()).sum();
