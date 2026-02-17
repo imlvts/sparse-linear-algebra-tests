@@ -86,7 +86,7 @@ impl SparseTensorFBOB {
     }
 
     pub fn estimate_memory_usage(&self) -> usize {
-        self.m.estimate_memory_usage()
+        0 // TODO: restore when PathMap supports estimate_memory_usage
     }
 
     fn index_to_path(&self, ix: &[usize]) -> Vec<u8> {
@@ -105,6 +105,9 @@ impl SparseTensorFBOB {
     pub fn remove(&mut self, ix: &[usize]) -> Option<f32> {
         let path = self.index_to_path(ix);
         self.m.remove(&path[..])
+    }
+    pub fn attention_dry(&self, k: &Self, out: &mut Self) -> usize {
+        bob_attention::<true>(&mut self.m.read_zipper(), &mut k.m.read_zipper(), &mut out.m.write_zipper(), 0)
     }
 }
 
@@ -150,7 +153,7 @@ impl SparseMatrix for SparseTensorFBOB {
 // [b0,b1,h0,h1,k0,k1,d0,d1]  <- this is the best case if everything is in the right order
 // hqdb,hkdb->bhqk
 #[allow(non_snake_case)]
-fn bob_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUntracked<f32>, out: &mut WriteZipperUntracked<f32>, depth: usize) -> usize {
+fn bob_attention<const DRY_RUN: bool>(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUntracked<f32>, out: &mut WriteZipperUntracked<f32>, depth: usize) -> usize {
     let QF = 0b00001011u8; let QB = 0b00000111u8;
     let KF = 0b00001011u8; let KB = 0b00000100u8;
     let qm = Q.child_mask();
@@ -167,18 +170,18 @@ fn bob_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUntracked<f
 
             Q.descend_to_byte(i);
             K.descend_to_byte(j);
-            out.descend_to_byte(out_b);
+            if !DRY_RUN { out.descend_to_byte(out_b); }
             if depth == 63 {
                 let total = out.get_val_or_set_mut(0f32);
                 *total += unsafe { *Q.val().unwrap_unchecked() * *K.val().unwrap_unchecked() };
                 count += 1;
                 // unsafe { COUNT += 1; }
             } else {
-                count += bob_attention(Q, K, out, depth + 1);
+                count += bob_attention::<DRY_RUN>(Q, K, out, depth + 1);
             }
             Q.ascend_byte();
             K.ascend_byte();
-            out.ascend_byte();
+            if !DRY_RUN { out.ascend_byte(); }
         }
     }
     count
@@ -189,7 +192,7 @@ impl Attention for SparseTensorFBOB {
     /// path = [00001100, 00000100]
     /// bhqd,bhkd->bhqk  ((to be) auto generated, do not touch)
     fn attention(&self, k: &Self, out: &mut Self) -> usize {
-        bob_attention(&mut self.m.read_zipper(), &mut k.m.read_zipper(), &mut out.m.write_zipper(), 0)
+        bob_attention::<false>(&mut self.m.read_zipper(), &mut k.m.read_zipper(), &mut out.m.write_zipper(), 0)
     }
 }
 // ============================================================================
@@ -234,7 +237,7 @@ impl SparseTensorFWeave {
         Self { m: PathMap::new(), d: dimensions, p: Vec::new() } 
     }
     pub fn estimate_memory_usage(&self) -> usize {
-        self.m.estimate_memory_usage()
+        0 // TODO: restore when PathMap supports estimate_memory_usage
     }
 
     fn index_to_path(&self, ix: &[usize]) -> Vec<u8> {
@@ -427,26 +430,26 @@ fn _byte_weave_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUnt
 
 // [b0,h0,k0,d0,b1,h1,k1,d1]
 #[allow(non_snake_case, unused)]
-fn short_weave_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUntracked<f32>, out: &mut WriteZipperUntracked<f32>) -> usize {
+fn short_weave_attention<const DRY_RUN: bool>(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUntracked<f32>, out: &mut WriteZipperUntracked<f32>) -> usize {
     let bm = Q.child_mask().and(&K.child_mask());
     let mut count = 0;
     for b in bm.iter() {
         Q.descend_to_byte(b);
         K.descend_to_byte(b);
-        out.descend_to_byte(b);
+        if !DRY_RUN { out.descend_to_byte(b); }
         let hm = Q.child_mask().and(&K.child_mask());
         for h in hm.iter() {
             Q.descend_to_byte(h);
             K.descend_to_byte(h);
-            out.descend_to_byte(h);
+            if !DRY_RUN { out.descend_to_byte(h); }
             let qm = Q.child_mask();
             for q in qm.iter() {
                 Q.descend_to_byte(q);
-                out.descend_to_byte(q);
+                if !DRY_RUN { out.descend_to_byte(q); }
                 let km = K.child_mask();
                 for k in km.iter() {
                     K.descend_to_byte(k);
-                    out.descend_to_byte(k);
+                    if !DRY_RUN { out.descend_to_byte(k); }
 
 
                     let dm = Q.child_mask().and(&K.child_mask());
@@ -458,20 +461,20 @@ fn short_weave_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUnt
                     for b in bm.iter() {
                         Q.descend_to_byte(b);
                         K.descend_to_byte(b);
-                        out.descend_to_byte(b);
+                        if !DRY_RUN { out.descend_to_byte(b); }
                         let hm = Q.child_mask().and(&K.child_mask());
                         for h in hm.iter() {
                             Q.descend_to_byte(h);
                             K.descend_to_byte(h);
-                            out.descend_to_byte(h);
+                            if !DRY_RUN { out.descend_to_byte(h); }
                             let qm = Q.child_mask();
                             for q in qm.iter() {
                                 Q.descend_to_byte(q);
-                                out.descend_to_byte(q);
+                                if !DRY_RUN { out.descend_to_byte(q); }
                                 let km = K.child_mask();
                                 for k in km.iter() {
                                     K.descend_to_byte(k);
-                                    out.descend_to_byte(k);
+                                    if !DRY_RUN { out.descend_to_byte(k); }
 
 
                                         let mut acc = 0f32;
@@ -490,23 +493,25 @@ fn short_weave_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUnt
                                             K.ascend_byte();
                                         }
 
-                                    let total = out.get_val_or_set_mut(0f32);
-                                    *total += acc;
+                                    if !DRY_RUN {
+                                        let total = out.get_val_or_set_mut(0f32);
+                                        *total += acc;
+                                    }
 
 
                                     K.ascend_byte();
-                                    out.ascend_byte();
+                                    if !DRY_RUN { out.ascend_byte(); }
                                 }
                                 Q.ascend_byte();
-                                out.ascend_byte();
+                                if !DRY_RUN { out.ascend_byte(); }
                             }
                             Q.ascend_byte();
                             K.ascend_byte();
-                            out.ascend_byte();
+                            if !DRY_RUN { out.ascend_byte(); }
                         }
                         Q.ascend_byte();
                         K.ascend_byte();
-                        out.ascend_byte();
+                        if !DRY_RUN { out.ascend_byte(); }
                     }
 
 
@@ -516,18 +521,18 @@ fn short_weave_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUnt
 
 
                     K.ascend_byte();
-                    out.ascend_byte();
+                    if !DRY_RUN { out.ascend_byte(); }
                 }
                 Q.ascend_byte();
-                out.ascend_byte();
+                if !DRY_RUN { out.ascend_byte(); }
             }
             Q.ascend_byte();
             K.ascend_byte();
-            out.ascend_byte();
+            if !DRY_RUN { out.ascend_byte(); }
         }
         Q.ascend_byte();
         K.ascend_byte();
-        out.ascend_byte();
+        if !DRY_RUN { out.ascend_byte(); }
     }
     count
 }
@@ -536,7 +541,7 @@ fn short_weave_attention(Q: &mut ReadZipperUntracked<f32>, K: &mut ReadZipperUnt
 impl Attention for SparseTensorFWeave {
     /// bhqd,bhkd->bhqk  ((to be) auto generated, do not touch)
     fn attention(&self, k: &Self, out: &mut Self) -> usize {
-        short_weave_attention(&mut self.m.read_zipper(), &mut k.m.read_zipper(), &mut out.m.write_zipper())
+        short_weave_attention::<false>(&mut self.m.read_zipper(), &mut k.m.read_zipper(), &mut out.m.write_zipper())
     }
 }
 
