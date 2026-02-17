@@ -1,145 +1,24 @@
 use std::collections::BTreeMap;
-use std::fmt;
-use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Rem, Sub};
-
-use num_traits::{Num, One, Zero};
+use num_traits::Zero;
 use rand::Rng;
-use sprs::{CsMat, TriMat};
 
-use crate::graph_csr::GRAPH_USE_SATURATING_ARITH;
+use magnus::{SparseMatrixCSR, magnus_spgemm, magnus_spgemm_parallel, MagnusConfig};
 
-// ---------------------------------------------------------------------------
-// Sat64 — newtype over u64 with saturating arithmetic
-// ---------------------------------------------------------------------------
+use crate::graph_sprs::Sat64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Sat64(pub u64);
-
-impl fmt::Display for Sat64 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Add for Sat64 {
-    type Output = Self;
-    #[inline]
-    fn add(self, rhs: Self) -> Self {
-        if GRAPH_USE_SATURATING_ARITH {
-            Sat64(self.0.saturating_add(rhs.0))
-        } else {
-            Sat64(self.0 + rhs.0)
-        }
-    }
-}
-
-impl<'a, 'b> Add<&'b Sat64> for &'a Sat64 {
-    type Output = Sat64;
-    #[inline]
-    fn add(self, rhs: &'b Sat64) -> Sat64 {
-        *self + *rhs
-    }
-}
-
-impl AddAssign for Sat64 {
-    #[inline]
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
-}
-
-impl Sub for Sat64 {
-    type Output = Self;
-    #[inline]
-    fn sub(self, rhs: Self) -> Self {
-        Sat64(self.0.saturating_sub(rhs.0))
-    }
-}
-
-impl Mul for Sat64 {
-    type Output = Self;
-    #[inline]
-    fn mul(self, rhs: Self) -> Self {
-        if GRAPH_USE_SATURATING_ARITH {
-            Sat64(self.0.saturating_mul(rhs.0))
-        } else {
-            Sat64(self.0 * rhs.0)
-        }
-    }
-}
-
-impl<'a, 'b> Mul<&'b Sat64> for &'a Sat64 {
-    type Output = Sat64;
-    #[inline]
-    fn mul(self, rhs: &'b Sat64) -> Sat64 {
-        *self * *rhs
-    }
-}
-
-impl MulAssign for Sat64 {
-    #[inline]
-    fn mul_assign(&mut self, rhs: Self) {
-        *self = *self * rhs;
-    }
-}
-
-impl Div for Sat64 {
-    type Output = Self;
-    #[inline]
-    fn div(self, rhs: Self) -> Self {
-        Sat64(self.0 / rhs.0)
-    }
-}
-
-impl Rem for Sat64 {
-    type Output = Self;
-    #[inline]
-    fn rem(self, rhs: Self) -> Self {
-        Sat64(self.0 % rhs.0)
-    }
-}
-
-impl Zero for Sat64 {
-    #[inline]
-    fn zero() -> Self {
-        Sat64(0)
-    }
-    #[inline]
-    fn is_zero(&self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl One for Sat64 {
-    #[inline]
-    fn one() -> Self {
-        Sat64(1)
-    }
-}
-
-impl Num for Sat64 {
-    type FromStrRadixErr = <u64 as Num>::FromStrRadixErr;
-    fn from_str_radix(str: &str, radix: u32) -> Result<Self, Self::FromStrRadixErr> {
-        u64::from_str_radix(str, radix).map(Sat64)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SprsMatrix — wrapper around sprs::CsMat<Sat64>
-// ---------------------------------------------------------------------------
-
+/// Sparse integer matrix backed by MAGNUS SpGEMM library (ICS'25 row-categorization algorithm).
 #[derive(Clone, Debug)]
-pub struct SprsMatrix {
+pub struct MagnusMatrix {
     pub n: usize,
-    pub mat: CsMat<Sat64>,
+    pub mat: SparseMatrixCSR<Sat64>,
 }
 
-impl SprsMatrix {
+impl MagnusMatrix {
     /// Empty n×n matrix.
     pub fn new(n: usize) -> Self {
         Self {
             n,
-            mat: CsMat::zero((n, n)),
+            mat: SparseMatrixCSR::zeros(n, n),
         }
     }
 
@@ -147,26 +26,59 @@ impl SprsMatrix {
     pub fn identity(n: usize) -> Self {
         Self {
             n,
-            mat: CsMat::eye(n),
+            mat: SparseMatrixCSR::identity(n),
         }
     }
 
-    /// Build from COO triplets via TriMat (duplicates are summed).
-    pub fn from_coo(n: usize, triplets: &[(usize, usize, u64)]) -> Self {
-        let mut tri = TriMat::with_capacity((n, n), triplets.len());
-        for &(r, c, v) in triplets {
-            tri.add_triplet(r, c, Sat64(v));
+    /// Build from COO triplets. Sorts by (row, col), merges duplicates by summing.
+    fn from_coo(n: usize, triplets: &mut Vec<(usize, usize, u64)>) -> Self {
+        triplets.sort_unstable_by_key(|&(r, c, _)| (r, c));
+
+        // Dedup-sum
+        let mut deduped: Vec<(usize, usize, Sat64)> = Vec::with_capacity(triplets.len());
+        let mut prev_row = usize::MAX;
+        let mut prev_col = usize::MAX;
+        for &(r, c, v) in triplets.iter() {
+            if r == prev_row && c == prev_col {
+                deduped.last_mut().unwrap().2 += Sat64(v);
+            } else {
+                deduped.push((r, c, Sat64(v)));
+                prev_row = r;
+                prev_col = c;
+            }
         }
+
+        // Build CSR arrays
+        let mut row_ptr = Vec::with_capacity(n + 1);
+        let mut col_idx = Vec::new();
+        let mut values = Vec::new();
+        let mut cur_row = 0;
+        row_ptr.push(0);
+
+        for &(r, c, v) in &deduped {
+            if v.0 == 0 { continue; }
+            while cur_row < r {
+                row_ptr.push(col_idx.len());
+                cur_row += 1;
+            }
+            col_idx.push(c);
+            values.push(v);
+        }
+        while cur_row < n {
+            row_ptr.push(col_idx.len());
+            cur_row += 1;
+        }
+
         Self {
             n,
-            mat: tri.to_csr(),
+            mat: SparseMatrixCSR::new(n, n, row_ptr, col_idx, values),
         }
     }
 
     /// Build from directed edge list.
     pub fn from_edges(n: usize, edges: &[(usize, usize)]) -> Self {
-        let triplets: Vec<_> = edges.iter().map(|&(r, c)| (r, c, 1u64)).collect();
-        Self::from_coo(n, &triplets)
+        let mut triplets: Vec<_> = edges.iter().map(|&(r, c)| (r, c, 1u64)).collect();
+        Self::from_coo(n, &mut triplets)
     }
 
     /// Build from edge list, making it undirected (symmetric).
@@ -178,10 +90,10 @@ impl SprsMatrix {
                 triplets.push((c, r, 1u64));
             }
         }
-        Self::from_coo(n, &triplets)
+        Self::from_coo(n, &mut triplets)
     }
 
-    /// Build from named edge pairs. Returns the matrix and name→index mapping.
+    /// Build from named edge pairs. Returns the matrix and name->index mapping.
     pub fn from_adjacency<'a>(
         it: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> (Self, BTreeMap<String, usize>) {
@@ -214,7 +126,7 @@ impl SprsMatrix {
             let c = if c >= r { c + 1 } else { c };
             triplets.push((r, c, 1u64));
         }
-        Self::from_coo(n, &triplets)
+        Self::from_coo(n, &mut triplets)
     }
 
     /// N-dimensional Moore neighborhood lattice.
@@ -268,33 +180,40 @@ impl SprsMatrix {
                 coord[d] = 0;
             }
         }
-        Self::from_coo(total, &triplets)
+        Self::from_coo(total, &mut triplets)
     }
 
     /// Randomly keep a fraction of edges, preserving symmetry.
     pub fn thin(&self, rng: &mut impl Rng, density: f64) -> Self {
         let mut triplets = Vec::new();
         for r in 0..self.n {
-            if let Some(row) = self.mat.outer_view(r) {
-                for (c, &v) in row.iter() {
-                    if r <= c && rng.random_range(0.0f64..1.0) < density {
-                        triplets.push((r, c, v.0));
-                        if r != c {
-                            let rev = self.get(c, r);
-                            if rev > 0 {
-                                triplets.push((c, r, rev));
-                            }
+            let start = self.mat.row_ptr[r];
+            let end = self.mat.row_ptr[r + 1];
+            for idx in start..end {
+                let c = self.mat.col_idx[idx];
+                let v = self.mat.values[idx].0;
+                if r <= c && rng.random_range(0.0f64..1.0) < density {
+                    triplets.push((r, c, v));
+                    if r != c {
+                        let rev = self.get(c, r);
+                        if rev > 0 {
+                            triplets.push((c, r, rev));
                         }
                     }
                 }
             }
         }
-        Self::from_coo(self.n, &triplets)
+        Self::from_coo(self.n, &mut triplets)
     }
 
-    /// Lookup value at (r, c).
+    /// Lookup value at (r, c) via binary search.
     pub fn get(&self, r: usize, c: usize) -> u64 {
-        self.mat.get(r, c).map_or(0, |v| v.0)
+        let start = self.mat.row_ptr[r];
+        let end = self.mat.row_ptr[r + 1];
+        match self.mat.col_idx[start..end].binary_search(&c) {
+            Ok(i) => self.mat.values[start + i].0,
+            Err(_) => 0,
+        }
     }
 
     /// Number of non-zero entries.
@@ -302,21 +221,83 @@ impl SprsMatrix {
         self.mat.nnz()
     }
 
-    /// Matrix multiply via sprs SpGEMM (auto-threaded with multi_thread feature).
+    /// Matrix multiply via MAGNUS parallel SpGEMM.
     pub fn matmul(&self, other: &Self) -> Self {
         assert_eq!(self.n, other.n);
+        let config = MagnusConfig::default();
         Self {
             n: self.n,
-            mat: &self.mat * &other.mat,
+            mat: magnus_spgemm_parallel(&self.mat, &other.mat, &config),
         }
     }
 
-    /// Element-wise addition.
-    pub fn add(&self, other: &Self) -> Self {
+    /// Matrix multiply via MAGNUS sequential SpGEMM.
+    pub fn matmul_seq(&self, other: &Self) -> Self {
         assert_eq!(self.n, other.n);
+        let config = MagnusConfig::default();
         Self {
             n: self.n,
-            mat: &self.mat + &other.mat,
+            mat: magnus_spgemm(&self.mat, &other.mat, &config),
+        }
+    }
+
+    /// Element-wise addition via sorted merge of each row.
+    pub fn add(&self, other: &Self) -> Self {
+        assert_eq!(self.n, other.n);
+        let n = self.n;
+
+        let mut row_ptr = Vec::with_capacity(n + 1);
+        let mut col_idx = Vec::new();
+        let mut values = Vec::new();
+        row_ptr.push(0);
+
+        for r in 0..n {
+            let a_start = self.mat.row_ptr[r];
+            let a_end = self.mat.row_ptr[r + 1];
+            let b_start = other.mat.row_ptr[r];
+            let b_end = other.mat.row_ptr[r + 1];
+
+            let mut ai = a_start;
+            let mut bi = b_start;
+
+            while ai < a_end && bi < b_end {
+                let ac = self.mat.col_idx[ai];
+                let bc = other.mat.col_idx[bi];
+                if ac < bc {
+                    col_idx.push(ac);
+                    values.push(self.mat.values[ai]);
+                    ai += 1;
+                } else if ac > bc {
+                    col_idx.push(bc);
+                    values.push(other.mat.values[bi]);
+                    bi += 1;
+                } else {
+                    let v = self.mat.values[ai] + other.mat.values[bi];
+                    if !v.is_zero() {
+                        col_idx.push(ac);
+                        values.push(v);
+                    }
+                    ai += 1;
+                    bi += 1;
+                }
+            }
+            while ai < a_end {
+                col_idx.push(self.mat.col_idx[ai]);
+                values.push(self.mat.values[ai]);
+                ai += 1;
+            }
+            while bi < b_end {
+                col_idx.push(other.mat.col_idx[bi]);
+                values.push(other.mat.values[bi]);
+                bi += 1;
+            }
+
+            row_ptr.push(col_idx.len());
+        }
+
+        Self {
+            n,
+            mat: SparseMatrixCSR::new(n, n, row_ptr, col_idx, values),
         }
     }
 
@@ -343,7 +324,10 @@ impl SprsMatrix {
         loop {
             let next = current.matmul(&current);
             k += 1;
-            if next.nnz() == current.nnz() && same_structure(&next.mat, &current.mat) {
+            if next.nnz() == current.nnz()
+                && next.mat.row_ptr == current.mat.row_ptr
+                && next.mat.col_idx == current.mat.col_idx
+            {
                 return (next, k);
             }
             current = next;
@@ -374,7 +358,7 @@ impl SprsMatrix {
         component
     }
 
-    /// Connected components via union-find. O(nnz * α(n)).
+    /// Connected components via union-find. O(nnz * alpha(n)).
     pub fn connected_components_uf(&self) -> Vec<usize> {
         let mut parent: Vec<usize> = (0..self.n).collect();
         let mut rank = vec![0u8; self.n];
@@ -404,10 +388,10 @@ impl SprsMatrix {
         }
 
         for r in 0..self.n {
-            if let Some(row) = self.mat.outer_view(r) {
-                for (c, _) in row.iter() {
-                    union(&mut parent, &mut rank, r, c);
-                }
+            let start = self.mat.row_ptr[r];
+            let end = self.mat.row_ptr[r + 1];
+            for idx in start..end {
+                union(&mut parent, &mut rank, r, self.mat.col_idx[idx]);
             }
         }
 
@@ -447,12 +431,6 @@ impl SprsMatrix {
     }
 }
 
-/// Check if two CsMat have the same sparsity structure (same indptr + indices).
-fn same_structure(a: &CsMat<Sat64>, b: &CsMat<Sat64>) -> bool {
-    a.indptr().raw_storage() == b.indptr().raw_storage()
-        && a.indices() == b.indices()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,8 +438,8 @@ mod tests {
 
     #[test]
     fn test_identity_matmul() {
-        let m = SprsMatrix::from_edges(3, &[(0, 1), (1, 2)]);
-        let id = SprsMatrix::identity(3);
+        let m = MagnusMatrix::from_edges(3, &[(0, 1), (1, 2)]);
+        let id = MagnusMatrix::identity(3);
         let result = m.matmul(&id);
         assert_eq!(result.get(0, 1), 1);
         assert_eq!(result.get(1, 2), 1);
@@ -471,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_path_counting_triangle() {
-        let m = SprsMatrix::from_edges(3, &[(0, 1), (1, 2), (2, 0)]);
+        let m = MagnusMatrix::from_edges(3, &[(0, 1), (1, 2), (2, 0)]);
         let m2 = m.matmul(&m);
         assert_eq!(m2.get(0, 2), 1);
         assert_eq!(m2.get(1, 0), 1);
@@ -484,20 +462,20 @@ mod tests {
 
     #[test]
     fn test_path_counting_parallel_paths() {
-        let m = SprsMatrix::from_edges(2, &[(0, 1), (0, 1)]);
+        let m = MagnusMatrix::from_edges(2, &[(0, 1), (0, 1)]);
         assert_eq!(m.get(0, 1), 2);
     }
 
     #[test]
     fn test_path_counting_diamond() {
-        let m = SprsMatrix::from_edges(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        let m = MagnusMatrix::from_edges(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
         let m2 = m.matmul(&m);
         assert_eq!(m2.get(0, 3), 2);
     }
 
     #[test]
     fn test_reachability_chain() {
-        let m = SprsMatrix::from_edges(4, &[(0, 1), (1, 2), (2, 3)]);
+        let m = MagnusMatrix::from_edges(4, &[(0, 1), (1, 2), (2, 3)]);
         let (sum, _k) = m.reachability_sum();
         assert!(sum.get(0, 1) > 0);
         assert!(sum.get(0, 2) > 0);
@@ -513,15 +491,15 @@ mod tests {
     fn test_power_until_stable_chain() {
         let n = 64;
         let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
-        let m = SprsMatrix::from_edges(n, &edges);
-        let with_id = m.add(&SprsMatrix::identity(n));
+        let m = MagnusMatrix::from_edges(n, &edges);
+        let with_id = m.add(&MagnusMatrix::identity(n));
         let (_stable, iters) = with_id.power_until_stable();
         assert!(iters <= 8, "took {iters} iterations for chain of {n}");
     }
 
     #[test]
     fn test_connected_components_two_triangles() {
-        let m = SprsMatrix::from_edges_undirected(6, &[
+        let m = MagnusMatrix::from_edges_undirected(6, &[
             (0, 1), (1, 2), (2, 0),
             (3, 4), (4, 5), (5, 3),
         ]);
@@ -535,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_connected_components_isolated() {
-        let m = SprsMatrix::new(5);
+        let m = MagnusMatrix::new(5);
         let comp = m.connected_components();
         let unique: HashSet<usize> = comp.into_iter().collect();
         assert_eq!(unique.len(), 5);
@@ -544,7 +522,7 @@ mod tests {
     #[test]
     fn test_from_adjacency_basic() {
         let edges = vec![("a", "b"), ("b", "c"), ("c", "a")];
-        let (m, names) = SprsMatrix::from_adjacency(edges.into_iter());
+        let (m, names) = MagnusMatrix::from_adjacency(edges.into_iter());
         assert_eq!(names.len(), 3);
         assert_eq!(m.n, 3);
         assert_eq!(m.nnz(), 3);
@@ -560,7 +538,7 @@ mod tests {
     #[test]
     fn test_from_adjacency_duplicate_edges() {
         let edges = vec![("x", "y"), ("x", "y"), ("y", "x")];
-        let (m, names) = SprsMatrix::from_adjacency(edges.into_iter());
+        let (m, names) = MagnusMatrix::from_adjacency(edges.into_iter());
         let x = names["x"];
         let y = names["y"];
         assert_eq!(m.get(x, y), 2);
@@ -570,7 +548,7 @@ mod tests {
     #[test]
     fn test_from_adjacency_self_loop() {
         let edges = vec![("a", "a"), ("a", "b")];
-        let (m, names) = SprsMatrix::from_adjacency(edges.into_iter());
+        let (m, names) = MagnusMatrix::from_adjacency(edges.into_iter());
         let a = names["a"];
         let b = names["b"];
         assert_eq!(m.get(a, a), 1);
@@ -581,7 +559,7 @@ mod tests {
     #[test]
     fn test_from_adjacency_components() {
         let edges = vec![("a", "b"), ("b", "a"), ("c", "d"), ("d", "c")];
-        let (m, names) = SprsMatrix::from_adjacency(edges.into_iter());
+        let (m, names) = MagnusMatrix::from_adjacency(edges.into_iter());
         let comp = m.connected_components();
         assert_eq!(comp[names["a"]], comp[names["b"]]);
         assert_eq!(comp[names["c"]], comp[names["d"]]);
@@ -590,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_lattice_1d_no_torus() {
-        let m = SprsMatrix::lattice(&[5], false);
+        let m = MagnusMatrix::lattice(&[5], false);
         assert_eq!(m.n, 5);
         assert_eq!(m.get(0, 1), 1);
         assert_eq!(m.get(1, 0), 1);
@@ -602,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_lattice_1d_torus() {
-        let m = SprsMatrix::lattice(&[5], true);
+        let m = MagnusMatrix::lattice(&[5], true);
         assert_eq!(m.get(0, 4), 1);
         assert_eq!(m.get(4, 0), 1);
         assert_eq!(m.nnz(), 10);
@@ -610,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_lattice_2d_corner() {
-        let m = SprsMatrix::lattice(&[3, 3], false);
+        let m = MagnusMatrix::lattice(&[3, 3], false);
         assert_eq!(m.n, 9);
         assert_eq!(m.get(0, 1), 1);
         assert_eq!(m.get(0, 3), 1);
@@ -620,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_lattice_2d_center() {
-        let m = SprsMatrix::lattice(&[3, 3], false);
+        let m = MagnusMatrix::lattice(&[3, 3], false);
         let mut count = 0;
         for j in 0..9 {
             if m.get(4, j) > 0 {
@@ -632,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_lattice_2d_torus() {
-        let m = SprsMatrix::lattice(&[3, 3], true);
+        let m = MagnusMatrix::lattice(&[3, 3], true);
         assert_eq!(m.n, 9);
         for i in 0..9 {
             let mut count = 0;
@@ -648,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_lattice_2d_single_component() {
-        let m = SprsMatrix::lattice(&[4, 4], false);
+        let m = MagnusMatrix::lattice(&[4, 4], false);
         let comp = m.connected_components();
         for i in 1..16 {
             assert_eq!(comp[0], comp[i]);
@@ -657,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_lattice_3d() {
-        let m = SprsMatrix::lattice(&[2, 2, 2], false);
+        let m = MagnusMatrix::lattice(&[2, 2, 2], false);
         assert_eq!(m.n, 8);
         let mut count = 0;
         for j in 0..8 {
@@ -671,19 +649,21 @@ mod tests {
 
     #[test]
     fn test_lattice_symmetry() {
-        let m = SprsMatrix::lattice(&[4, 3], false);
+        let m = MagnusMatrix::lattice(&[4, 3], false);
         for r in 0..m.n {
-            if let Some(row) = m.mat.outer_view(r) {
-                for (c, v) in row.iter() {
-                    assert_eq!(m.get(c, r), v.0, "asymmetry at ({r},{c})");
-                }
+            let start = m.mat.row_ptr[r];
+            let end = m.mat.row_ptr[r + 1];
+            for idx in start..end {
+                let c = m.mat.col_idx[idx];
+                let v = m.mat.values[idx].0;
+                assert_eq!(m.get(c, r), v, "asymmetry at ({r},{c})");
             }
         }
     }
 
     #[test]
     fn test_connected_components_single_component() {
-        let m = SprsMatrix::from_edges_undirected(4, &[(0, 1), (1, 2), (2, 3)]);
+        let m = MagnusMatrix::from_edges_undirected(4, &[(0, 1), (1, 2), (2, 3)]);
         let comp = m.connected_components();
         assert_eq!(comp[0], comp[1]);
         assert_eq!(comp[1], comp[2]);
@@ -691,9 +671,20 @@ mod tests {
     }
 
     #[test]
-    fn bench_matmul_sprs_vs_csr() {
+    fn test_matmul_seq_vs_par() {
+        let m = MagnusMatrix::from_edges(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        let seq = m.matmul_seq(&m);
+        let par = m.matmul(&m);
+        assert_eq!(seq.nnz(), par.nnz());
+        assert_eq!(seq.get(0, 3), par.get(0, 3));
+        assert_eq!(seq.get(0, 3), 2);
+    }
+
+    #[test]
+    fn bench_matmul_magnus() {
         use crate::graph::SparseCountMatrix;
         use crate::graph_csr::CsrMatrix;
+        use crate::graph_sprs::SprsMatrix;
         use rand::prelude::StdRng;
         use rand::SeedableRng;
         use std::time::Instant;
@@ -703,11 +694,12 @@ mod tests {
         let edges_per_node: &[f64] = &[2.0, 3.0, 4.0, 8.0, 26.0];
 
         println!();
-        println!("side,nodes,e_per_n,nnz,components,orig_btree_us,csr_us,csr_par_us,sprs_us,ratio_csr,ratio_par,ratio_sprs");
+        println!("side,nodes,e_per_n,nnz,components,orig_btree_us,csr_us,csr_par_us,sprs_us,magnus_seq_us,magnus_par_us,x_csr,x_csr_par,x_sprs,x_magnus_seq,x_magnus_par");
         for &s in grid_sizes {
             let full_btree = SparseCountMatrix::lattice(&[s, s, s], true);
             let full_csr = CsrMatrix::lattice(&[s, s, s], true);
             let full_sprs = SprsMatrix::lattice(&[s, s, s], true);
+            let full_magnus = MagnusMatrix::lattice(&[s, s, s], true);
             let n = full_btree.n;
             let full_epn = full_btree.nnz() as f64 / n as f64;
 
@@ -719,33 +711,38 @@ mod tests {
                 } else {
                     full_btree.thin(&mut rng, density)
                 };
-                let b_bt = a_bt.clone();
 
-                // Build CSR from the same edges
+                // Build other formats from same edges
+                let triplets_u64: Vec<(usize, usize, u64)> = a_bt
+                    .entries
+                    .iter()
+                    .map(|(&(r, c), &v)| (r, c, v))
+                    .collect();
+
                 let a_csr = if density >= 1.0 {
                     full_csr.clone()
                 } else {
-                    let mut triplets: Vec<(usize, usize, u64)> = a_bt
-                        .entries
-                        .iter()
-                        .map(|(&(r, c), &v)| (r, c, v))
-                        .collect();
-                    CsrMatrix::from_coo(n, &mut triplets)
+                    let mut t = triplets_u64.clone();
+                    CsrMatrix::from_coo(n, &mut t)
                 };
-                let b_csr = a_csr.clone();
 
-                // Build sprs from same edges
                 let a_sprs = if density >= 1.0 {
                     full_sprs.clone()
                 } else {
-                    let triplets: Vec<(usize, usize, u64)> = a_bt
-                        .entries
-                        .iter()
-                        .map(|(&(r, c), &v)| (r, c, v))
-                        .collect();
-                    SprsMatrix::from_coo(n, &triplets)
+                    SprsMatrix::from_coo(n, &triplets_u64)
                 };
+
+                let a_magnus = if density >= 1.0 {
+                    full_magnus.clone()
+                } else {
+                    let mut t = triplets_u64.clone();
+                    MagnusMatrix::from_coo(n, &mut t)
+                };
+
+                let b_bt = a_bt.clone();
+                let b_csr = a_csr.clone();
                 let b_sprs = a_sprs.clone();
+                let b_magnus = a_magnus.clone();
 
                 let t0 = Instant::now();
                 let _r_bt = a_bt.matmul(&b_bt);
@@ -763,27 +760,32 @@ mod tests {
                 let _r_sprs = a_sprs.matmul(&b_sprs);
                 let t_sprs = t0.elapsed().as_micros();
 
+                let t0 = Instant::now();
+                let _r_magnus_seq = a_magnus.matmul_seq(&b_magnus);
+                let t_magnus_seq = t0.elapsed().as_micros();
+
+                let t0 = Instant::now();
+                let _r_magnus_par = a_magnus.matmul(&b_magnus);
+                let t_magnus_par = t0.elapsed().as_micros();
+
                 let components = a_csr.num_components();
 
-                let ratio_csr = if t_bt > 0 {
-                    t_csr as f64 / t_bt as f64
-                } else {
-                    0.0
-                };
-                let ratio_par = if t_bt > 0 {
-                    t_par as f64 / t_bt as f64
-                } else {
-                    0.0
-                };
-                let ratio_sprs = if t_bt > 0 {
-                    t_sprs as f64 / t_bt as f64
-                } else {
-                    0.0
+                let x = |t: u128| -> String {
+                    if t_bt > 0 {
+                        format!("{:.4}", t_bt as f64 / t as f64)
+                    } else {
+                        "inf".to_string()
+                    }
                 };
 
                 println!(
-                    "{s},{n},{epn:.0},{},{components},{t_bt},{t_csr},{t_par},{t_sprs},{ratio_csr:.6},{ratio_par:.6},{ratio_sprs:.6}",
-                    a_bt.nnz()
+                    "{s},{n},{epn:.0},{},{components},{t_bt},{t_csr},{t_par},{t_sprs},{t_magnus_seq},{t_magnus_par},{},{},{},{},{}",
+                    a_bt.nnz(),
+                    x(t_csr),
+                    x(t_par),
+                    x(t_sprs),
+                    x(t_magnus_seq),
+                    x(t_magnus_par),
                 );
             }
         }

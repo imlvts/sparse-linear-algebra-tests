@@ -16,6 +16,7 @@ blas = "0.23.0"
 blas-src = { version="0.14.0", features = ["openblas"] }
 rayon = "1"
 sprs = { path = "../sprs/sprs" }
+magnus = { path = "../ICS25-SpGEMM-magnuspp" }
 
 [features]
 viz = []
