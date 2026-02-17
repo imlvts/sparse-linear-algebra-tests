@@ -743,52 +743,57 @@ mod tests {
                 let b_sprs = a_sprs.clone();
                 let b_magnus = a_magnus.clone();
 
-                let t0 = Instant::now();
+                const ITERS: u32 = 10;
+
+                // Warmup + verify on first iteration
                 let r_bt = a_bt.matmul(&b_bt);
-                let t_bt = t0.elapsed().as_micros();
-
-                let t0 = Instant::now();
                 let r_csr = a_csr.matmul(&b_csr);
-                let t_csr = t0.elapsed().as_micros();
-
-                let t0 = Instant::now();
                 let r_par = a_csr.matmul_par(&b_csr);
-                let t_par = t0.elapsed().as_micros();
-
-                let t0 = Instant::now();
                 let r_sprs = a_sprs.matmul(&b_sprs);
-                let t_sprs = t0.elapsed().as_micros();
-
-                let t0 = Instant::now();
                 let r_magnus_seq = a_magnus.matmul_seq(&b_magnus);
-                let t_magnus_seq = t0.elapsed().as_micros();
-
-                let t0 = Instant::now();
                 let r_magnus_par = a_magnus.matmul(&b_magnus);
-                let t_magnus_par = t0.elapsed().as_micros();
 
-                // Verify all implementations agree
                 assert_eq!(r_bt.nnz(), r_csr.nnz(), "nnz mismatch: btree vs csr (s={s}, epn={epn})");
                 assert_eq!(r_csr.nnz(), r_par.nnz(), "nnz mismatch: csr vs csr_par (s={s}, epn={epn})");
                 assert_eq!(r_csr.nnz(), r_sprs.nnz(), "nnz mismatch: csr vs sprs (s={s}, epn={epn})");
                 assert_eq!(r_csr.nnz(), r_magnus_seq.nnz(), "nnz mismatch: csr vs magnus_seq (s={s}, epn={epn})");
                 assert_eq!(r_csr.nnz(), r_magnus_par.nnz(), "nnz mismatch: csr vs magnus_par (s={s}, epn={epn})");
-                // Spot-check values
                 for i in 0..n.min(10) {
                     for j in 0..n.min(10) {
-                        let v_bt = r_bt.get(i, j);
                         let v_csr = r_csr.get(i, j);
-                        let v_par = r_par.get(i, j);
-                        let v_sprs = r_sprs.get(i, j);
-                        let v_mseq = r_magnus_seq.get(i, j);
-                        let v_mpar = r_magnus_par.get(i, j);
-                        assert_eq!(v_bt, v_csr, "value mismatch btree vs csr at ({i},{j})");
-                        assert_eq!(v_csr, v_par, "value mismatch csr vs csr_par at ({i},{j})");
-                        assert_eq!(v_csr, v_sprs, "value mismatch csr vs sprs at ({i},{j})");
-                        assert_eq!(v_csr, v_mseq, "value mismatch csr vs magnus_seq at ({i},{j})");
-                        assert_eq!(v_csr, v_mpar, "value mismatch csr vs magnus_par at ({i},{j})");
+                        assert_eq!(r_bt.get(i, j), v_csr, "btree vs csr at ({i},{j})");
+                        assert_eq!(r_par.get(i, j), v_csr, "csr_par vs csr at ({i},{j})");
+                        assert_eq!(r_sprs.get(i, j), v_csr, "sprs vs csr at ({i},{j})");
+                        assert_eq!(r_magnus_seq.get(i, j), v_csr, "magnus_seq vs csr at ({i},{j})");
+                        assert_eq!(r_magnus_par.get(i, j), v_csr, "magnus_par vs csr at ({i},{j})");
                     }
                 }
+                drop((r_bt, r_csr, r_par, r_sprs, r_magnus_seq, r_magnus_par));
+
+                // Timed runs (10x average)
+                let t0 = Instant::now();
+                for _ in 0..ITERS { let _ = a_bt.matmul(&b_bt); }
+                let t_bt = t0.elapsed().as_micros() / ITERS as u128;
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS { let _ = a_csr.matmul(&b_csr); }
+                let t_csr = t0.elapsed().as_micros() / ITERS as u128;
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS { let _ = a_csr.matmul_par(&b_csr); }
+                let t_par = t0.elapsed().as_micros() / ITERS as u128;
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS { let _ = a_sprs.matmul(&b_sprs); }
+                let t_sprs = t0.elapsed().as_micros() / ITERS as u128;
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS { let _ = a_magnus.matmul_seq(&b_magnus); }
+                let t_magnus_seq = t0.elapsed().as_micros() / ITERS as u128;
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS { let _ = a_magnus.matmul(&b_magnus); }
+                let t_magnus_par = t0.elapsed().as_micros() / ITERS as u128;
 
                 let components = a_csr.num_components();
 

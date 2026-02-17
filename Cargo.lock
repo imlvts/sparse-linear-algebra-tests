@@ -478,6 +478,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 [[package]]
 name = "magnus"
 version = "0.1.0"
+source = "git+https://github.com/22-426/ICS25-SpGEMM-magnuspp#d6d70f7665f8c2924aed3dae6caf5c9566c246d7"
 dependencies = [
  "aligned-vec",
  "metal",
@@ -488,7 +489,7 @@ dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
- "sprs 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sprs",
 ]
 
 [[package]]
@@ -736,6 +737,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "pathmap"
 version = "0.3.0"
+source = "git+https://github.com/Adam-Vandervorst/PathMap#3a0b508d018e004f0eaeeba38b24ca0d9f4a1f63"
 dependencies = [
  "arrayvec",
  "dyn-clone",
@@ -754,6 +756,7 @@ dependencies = [
 [[package]]
 name = "pathmap-derive"
 version = "0.2.1"
+source = "git+https://github.com/Adam-Vandervorst/PathMap#3a0b508d018e004f0eaeeba38b24ca0d9f4a1f63"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1043,20 +1046,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_distr",
  "rayon",
- "sprs 0.11.4",
-]
-
-[[package]]
-name = "sprs"
-version = "0.11.4"
-dependencies = [
- "alga",
- "ndarray 0.17.2",
- "num-complex 0.4.6",
- "num-traits",
- "num_cpus",
- "rayon",
- "smallvec",
+ "sprs",
 ]
 
 [[package]]
