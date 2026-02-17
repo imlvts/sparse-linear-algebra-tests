@@ -1,19 +1,23 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::Saturating;
 use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Rem, Sub};
 
 use num_traits::{Num, One, Zero};
 use rand::Rng;
 use sprs::{CsMat, TriMat};
 
-use crate::graph_csr::GRAPH_USE_SATURATING_ARITH;
-
 // ---------------------------------------------------------------------------
-// Sat64 — newtype over u64 with saturating arithmetic
+// Sat64 — newtype over Saturating<u64> with num_traits impls for sprs
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Sat64(pub u64);
+
+impl Sat64 {
+    #[inline]
+    fn s(self) -> Saturating<u64> { Saturating(self.0) }
+}
 
 impl fmt::Display for Sat64 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -23,98 +27,54 @@ impl fmt::Display for Sat64 {
 
 impl Add for Sat64 {
     type Output = Self;
-    #[inline]
-    fn add(self, rhs: Self) -> Self {
-        if GRAPH_USE_SATURATING_ARITH {
-            Sat64(self.0.saturating_add(rhs.0))
-        } else {
-            Sat64(self.0 + rhs.0)
-        }
-    }
+    #[inline] fn add(self, rhs: Self) -> Self { Sat64((self.s() + rhs.s()).0) }
 }
 
 impl<'a, 'b> Add<&'b Sat64> for &'a Sat64 {
     type Output = Sat64;
-    #[inline]
-    fn add(self, rhs: &'b Sat64) -> Sat64 {
-        *self + *rhs
-    }
+    #[inline] fn add(self, rhs: &'b Sat64) -> Sat64 { *self + *rhs }
 }
 
 impl AddAssign for Sat64 {
-    #[inline]
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
+    #[inline] fn add_assign(&mut self, rhs: Self) { *self = *self + rhs; }
 }
 
 impl Sub for Sat64 {
     type Output = Self;
-    #[inline]
-    fn sub(self, rhs: Self) -> Self {
-        Sat64(self.0.saturating_sub(rhs.0))
-    }
+    #[inline] fn sub(self, rhs: Self) -> Self { Sat64((self.s() - rhs.s()).0) }
 }
 
 impl Mul for Sat64 {
     type Output = Self;
-    #[inline]
-    fn mul(self, rhs: Self) -> Self {
-        if GRAPH_USE_SATURATING_ARITH {
-            Sat64(self.0.saturating_mul(rhs.0))
-        } else {
-            Sat64(self.0 * rhs.0)
-        }
-    }
+    #[inline] fn mul(self, rhs: Self) -> Self { Sat64((self.s() * rhs.s()).0) }
 }
 
 impl<'a, 'b> Mul<&'b Sat64> for &'a Sat64 {
     type Output = Sat64;
-    #[inline]
-    fn mul(self, rhs: &'b Sat64) -> Sat64 {
-        *self * *rhs
-    }
+    #[inline] fn mul(self, rhs: &'b Sat64) -> Sat64 { *self * *rhs }
 }
 
 impl MulAssign for Sat64 {
-    #[inline]
-    fn mul_assign(&mut self, rhs: Self) {
-        *self = *self * rhs;
-    }
+    #[inline] fn mul_assign(&mut self, rhs: Self) { *self = *self * rhs; }
 }
 
 impl Div for Sat64 {
     type Output = Self;
-    #[inline]
-    fn div(self, rhs: Self) -> Self {
-        Sat64(self.0 / rhs.0)
-    }
+    #[inline] fn div(self, rhs: Self) -> Self { Sat64(self.0 / rhs.0) }
 }
 
 impl Rem for Sat64 {
     type Output = Self;
-    #[inline]
-    fn rem(self, rhs: Self) -> Self {
-        Sat64(self.0 % rhs.0)
-    }
+    #[inline] fn rem(self, rhs: Self) -> Self { Sat64(self.0 % rhs.0) }
 }
 
 impl Zero for Sat64 {
-    #[inline]
-    fn zero() -> Self {
-        Sat64(0)
-    }
-    #[inline]
-    fn is_zero(&self) -> bool {
-        self.0 == 0
-    }
+    #[inline] fn zero() -> Self { Sat64(0) }
+    #[inline] fn is_zero(&self) -> bool { self.0 == 0 }
 }
 
 impl One for Sat64 {
-    #[inline]
-    fn one() -> Self {
-        Sat64(1)
-    }
+    #[inline] fn one() -> Self { Sat64(1) }
 }
 
 impl Num for Sat64 {

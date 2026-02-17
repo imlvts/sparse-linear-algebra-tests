@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use num_traits::Zero;
 use rand::Rng;
 
 use magnus::{SparseMatrixCSR, magnus_spgemm, magnus_spgemm_parallel, MagnusConfig};
@@ -35,14 +34,14 @@ impl MagnusMatrix {
         triplets.sort_unstable_by_key(|&(r, c, _)| (r, c));
 
         // Dedup-sum
-        let mut deduped: Vec<(usize, usize, Sat64)> = Vec::with_capacity(triplets.len());
+        let mut deduped: Vec<(usize, usize, u64)> = Vec::with_capacity(triplets.len());
         let mut prev_row = usize::MAX;
         let mut prev_col = usize::MAX;
         for &(r, c, v) in triplets.iter() {
             if r == prev_row && c == prev_col {
-                deduped.last_mut().unwrap().2 += Sat64(v);
+                deduped.last_mut().unwrap().2 += v;
             } else {
-                deduped.push((r, c, Sat64(v)));
+                deduped.push((r, c, v));
                 prev_row = r;
                 prev_col = c;
             }
@@ -56,13 +55,13 @@ impl MagnusMatrix {
         row_ptr.push(0);
 
         for &(r, c, v) in &deduped {
-            if v.0 == 0 { continue; }
+            if v == 0 { continue; }
             while cur_row < r {
                 row_ptr.push(col_idx.len());
                 cur_row += 1;
             }
             col_idx.push(c);
-            values.push(v);
+            values.push(Sat64(v));
         }
         while cur_row < n {
             row_ptr.push(col_idx.len());
@@ -273,7 +272,7 @@ impl MagnusMatrix {
                     bi += 1;
                 } else {
                     let v = self.mat.values[ai] + other.mat.values[bi];
-                    if !v.is_zero() {
+                    if v.0 != 0 {
                         col_idx.push(ac);
                         values.push(v);
                     }
@@ -745,28 +744,51 @@ mod tests {
                 let b_magnus = a_magnus.clone();
 
                 let t0 = Instant::now();
-                let _r_bt = a_bt.matmul(&b_bt);
+                let r_bt = a_bt.matmul(&b_bt);
                 let t_bt = t0.elapsed().as_micros();
 
                 let t0 = Instant::now();
-                let _r_csr = a_csr.matmul(&b_csr);
+                let r_csr = a_csr.matmul(&b_csr);
                 let t_csr = t0.elapsed().as_micros();
 
                 let t0 = Instant::now();
-                let _r_par = a_csr.matmul_par(&b_csr);
+                let r_par = a_csr.matmul_par(&b_csr);
                 let t_par = t0.elapsed().as_micros();
 
                 let t0 = Instant::now();
-                let _r_sprs = a_sprs.matmul(&b_sprs);
+                let r_sprs = a_sprs.matmul(&b_sprs);
                 let t_sprs = t0.elapsed().as_micros();
 
                 let t0 = Instant::now();
-                let _r_magnus_seq = a_magnus.matmul_seq(&b_magnus);
+                let r_magnus_seq = a_magnus.matmul_seq(&b_magnus);
                 let t_magnus_seq = t0.elapsed().as_micros();
 
                 let t0 = Instant::now();
-                let _r_magnus_par = a_magnus.matmul(&b_magnus);
+                let r_magnus_par = a_magnus.matmul(&b_magnus);
                 let t_magnus_par = t0.elapsed().as_micros();
+
+                // Verify all implementations agree
+                assert_eq!(r_bt.nnz(), r_csr.nnz(), "nnz mismatch: btree vs csr (s={s}, epn={epn})");
+                assert_eq!(r_csr.nnz(), r_par.nnz(), "nnz mismatch: csr vs csr_par (s={s}, epn={epn})");
+                assert_eq!(r_csr.nnz(), r_sprs.nnz(), "nnz mismatch: csr vs sprs (s={s}, epn={epn})");
+                assert_eq!(r_csr.nnz(), r_magnus_seq.nnz(), "nnz mismatch: csr vs magnus_seq (s={s}, epn={epn})");
+                assert_eq!(r_csr.nnz(), r_magnus_par.nnz(), "nnz mismatch: csr vs magnus_par (s={s}, epn={epn})");
+                // Spot-check values
+                for i in 0..n.min(10) {
+                    for j in 0..n.min(10) {
+                        let v_bt = r_bt.get(i, j);
+                        let v_csr = r_csr.get(i, j);
+                        let v_par = r_par.get(i, j);
+                        let v_sprs = r_sprs.get(i, j);
+                        let v_mseq = r_magnus_seq.get(i, j);
+                        let v_mpar = r_magnus_par.get(i, j);
+                        assert_eq!(v_bt, v_csr, "value mismatch btree vs csr at ({i},{j})");
+                        assert_eq!(v_csr, v_par, "value mismatch csr vs csr_par at ({i},{j})");
+                        assert_eq!(v_csr, v_sprs, "value mismatch csr vs sprs at ({i},{j})");
+                        assert_eq!(v_csr, v_mseq, "value mismatch csr vs magnus_seq at ({i},{j})");
+                        assert_eq!(v_csr, v_mpar, "value mismatch csr vs magnus_par at ({i},{j})");
+                    }
+                }
 
                 let components = a_csr.num_components();
 

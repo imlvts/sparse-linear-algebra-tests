@@ -2,17 +2,16 @@ use std::collections::BTreeMap;
 use rand::Rng;
 use rayon::prelude::*;
 
-/// When true, use saturating add/mul to avoid overflow panics in path counting.
-pub const GRAPH_USE_SATURATING_ARITH: bool = true;
+use std::num::Saturating;
 
 #[inline(always)]
 fn sadd(a: u64, b: u64) -> u64 {
-    if GRAPH_USE_SATURATING_ARITH { a.saturating_add(b) } else { a + b }
+    (Saturating(a) + Saturating(b)).0
 }
 
 #[inline(always)]
 fn smul(a: u64, b: u64) -> u64 {
-    if GRAPH_USE_SATURATING_ARITH { a.saturating_mul(b) } else { a * b }
+    (Saturating(a) * Saturating(b)).0
 }
 
 /// Sparse integer matrix in Compressed Sparse Row (CSR) format.
@@ -377,60 +376,101 @@ impl CsrMatrix {
         Self { n, row_ptr, col_idx, values }
     }
 
-    /// Parallel matrix multiply using rayon. Each rayon task reuses a dense
-    /// accumulator across all rows it processes (via `map_init`).
+    /// Parallel matrix multiply using rayon. Two-pass symbolic+numeric:
+    /// pass 1 counts nnz per row, pass 2 fills exact-sized output arrays.
     pub fn matmul_par(&self, other: &Self) -> Self {
         assert_eq!(self.n, other.n);
         let n = self.n;
 
-        let rows: Vec<(Vec<usize>, Vec<u64>)> = (0..n).into_par_iter()
-            .map_init(
-                || (vec![0u64; n], Vec::<usize>::new()),
-                |(acc, nz_cols), i| {
-                    let a_start = self.row_ptr[i];
-                    let a_end = self.row_ptr[i + 1];
-                    for idx in a_start..a_end {
-                        let k = self.col_idx[idx];
-                        let a_ik = self.values[idx];
-                        let b_start = other.row_ptr[k];
-                        let b_end = other.row_ptr[k + 1];
-                        for jdx in b_start..b_end {
-                            let j = other.col_idx[jdx];
-                            if acc[j] == 0 {
-                                nz_cols.push(j);
-                            }
-                            acc[j] = sadd(acc[j], smul(a_ik, other.values[jdx]));
+        // Pass 1: symbolic — count nnz per output row
+        let mut nnz_per_row = vec![0usize; n];
+        nnz_per_row.par_iter_mut().enumerate().for_each_init(
+            || vec![false; n],
+            |mask, (i, nnz_out)| {
+                let mut count = 0usize;
+                let a_start = self.row_ptr[i];
+                let a_end = self.row_ptr[i + 1];
+                for idx in a_start..a_end {
+                    let k = self.col_idx[idx];
+                    let b_start = other.row_ptr[k];
+                    let b_end = other.row_ptr[k + 1];
+                    for jdx in b_start..b_end {
+                        let j = other.col_idx[jdx];
+                        if !mask[j] {
+                            mask[j] = true;
+                            count += 1;
                         }
                     }
-
-                    nz_cols.sort_unstable();
-                    let mut cols = Vec::with_capacity(nz_cols.len());
-                    let mut vals = Vec::with_capacity(nz_cols.len());
-                    for &j in nz_cols.iter() {
-                        let v = acc[j];
-                        if v != 0 {
-                            cols.push(j);
-                            vals.push(v);
-                        }
-                        acc[j] = 0;
+                }
+                *nnz_out = count;
+                // Clear mask
+                for idx in a_start..a_end {
+                    let k = self.col_idx[idx];
+                    let b_start = other.row_ptr[k];
+                    let b_end = other.row_ptr[k + 1];
+                    for jdx in b_start..b_end {
+                        mask[other.col_idx[jdx]] = false;
                     }
-                    nz_cols.clear();
-                    (cols, vals)
-                },
-            )
-            .collect();
+                }
+            },
+        );
 
-        // Stitch rows into CSR
-        let total_nnz: usize = rows.iter().map(|(c, _)| c.len()).sum();
+        // Build row_ptr from nnz counts
         let mut row_ptr = Vec::with_capacity(n + 1);
-        let mut col_idx = Vec::with_capacity(total_nnz);
-        let mut values = Vec::with_capacity(total_nnz);
         row_ptr.push(0);
-        for (cols, vals) in rows {
-            col_idx.extend_from_slice(&cols);
-            values.extend_from_slice(&vals);
-            row_ptr.push(col_idx.len());
+        for &c in &nnz_per_row {
+            row_ptr.push(row_ptr.last().unwrap() + c);
         }
+        let total_nnz = *row_ptr.last().unwrap();
+
+        // Allocate output arrays exactly
+        let mut col_idx = vec![0usize; total_nnz];
+        let mut values = vec![0u64; total_nnz];
+
+        // Pass 2: numeric — fill col_idx and values in parallel
+        // SAFETY: each row writes to a disjoint slice [row_ptr[i]..row_ptr[i+1]]
+        let col_ptr = &row_ptr;
+        let col_idx_ptr = col_idx.as_mut_ptr() as usize;
+        let values_ptr = values.as_mut_ptr() as usize;
+
+        (0..n).into_par_iter().for_each_init(
+            || (vec![0u64; n], Vec::<usize>::new()),
+            move |(acc, nz_cols), i| {
+                let a_start = self.row_ptr[i];
+                let a_end = self.row_ptr[i + 1];
+                for idx in a_start..a_end {
+                    let k = self.col_idx[idx];
+                    let a_ik = self.values[idx];
+                    let b_start = other.row_ptr[k];
+                    let b_end = other.row_ptr[k + 1];
+                    for jdx in b_start..b_end {
+                        let j = other.col_idx[jdx];
+                        if acc[j] == 0 {
+                            nz_cols.push(j);
+                        }
+                        acc[j] = sadd(acc[j], smul(a_ik, other.values[jdx]));
+                    }
+                }
+
+                nz_cols.sort_unstable();
+                let out_c = col_idx_ptr as *mut usize;
+                let out_v = values_ptr as *mut u64;
+                let out_start = col_ptr[i];
+                let mut pos = out_start;
+                for &j in nz_cols.iter() {
+                    let v = acc[j];
+                    if v != 0 {
+                        unsafe {
+                            *out_c.add(pos) = j;
+                            *out_v.add(pos) = v;
+                        }
+                        pos += 1;
+                    }
+                    acc[j] = 0;
+                }
+                nz_cols.clear();
+            },
+        );
 
         Self { n, row_ptr, col_idx, values }
     }
