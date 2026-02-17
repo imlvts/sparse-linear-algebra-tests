@@ -651,6 +651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "long-tests")]
     fn bench_matmul_sprs_vs_csr() {
         use crate::graph::SparseCountMatrix;
         use crate::graph_csr::CsrMatrix;
@@ -685,12 +686,12 @@ mod tests {
                 let a_csr = if density >= 1.0 {
                     full_csr.clone()
                 } else {
-                    let mut triplets: Vec<(usize, usize, u64)> = a_bt
+                    let mut triplets: Vec<(u32, u32, u64)> = a_bt
                         .entries
                         .iter()
-                        .map(|(&(r, c), &v)| (r, c, v))
+                        .map(|(&(r, c), &v)| (r as u32, c as u32, v))
                         .collect();
-                    CsrMatrix::from_coo(n, &mut triplets)
+                    CsrMatrix::from_coo(n as u32, &mut triplets)
                 };
                 let b_csr = a_csr.clone();
 

@@ -574,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "long-tests")]
     fn bench_matmul_maps_vs_range() {
         use std::time::Instant;
         use rand::prelude::StdRng;
@@ -613,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "long-tests")]
     fn bench_lattice_3d_power_until_stable() {
         use std::time::Instant;
         use rand::prelude::StdRng;

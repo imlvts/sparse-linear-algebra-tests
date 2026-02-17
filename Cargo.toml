@@ -20,3 +20,4 @@ magnus = { git = "https://github.com/22-426/ICS25-SpGEMM-magnuspp" }
 
 [features]
 viz = []
+long-tests = []
