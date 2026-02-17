@@ -4,6 +4,16 @@ use rayon::prelude::*;
 
 use std::num::Saturating;
 
+/// Wrapper to send a raw pointer across threads.
+/// SAFETY: caller must guarantee disjoint access from each thread.
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+impl<T> SendPtr<T> {
+    fn ptr(self) -> *mut T { self.0 }
+}
+
 #[inline(always)]
 fn sadd(a: u64, b: u64) -> u64 {
     (Saturating(a) + Saturating(b)).0
@@ -430,8 +440,8 @@ impl CsrMatrix {
         // Pass 2: numeric — fill col_idx and values in parallel
         // SAFETY: each row writes to a disjoint slice [row_ptr[i]..row_ptr[i+1]]
         let col_ptr = &row_ptr;
-        let col_idx_ptr = col_idx.as_mut_ptr() as usize;
-        let values_ptr = values.as_mut_ptr() as usize;
+        let out_c = SendPtr(col_idx.as_mut_ptr());
+        let out_v = SendPtr(values.as_mut_ptr());
 
         (0..n).into_par_iter().for_each_init(
             || (vec![0u64; n], Vec::<usize>::new()),
@@ -453,16 +463,14 @@ impl CsrMatrix {
                 }
 
                 nz_cols.sort_unstable();
-                let out_c = col_idx_ptr as *mut usize;
-                let out_v = values_ptr as *mut u64;
                 let out_start = col_ptr[i];
                 let mut pos = out_start;
                 for &j in nz_cols.iter() {
                     let v = acc[j];
                     if v != 0 {
                         unsafe {
-                            *out_c.add(pos) = j;
-                            *out_v.add(pos) = v;
+                            *out_c.ptr().add(pos) = j;
+                            *out_v.ptr().add(pos) = v;
                         }
                         pos += 1;
                     }
