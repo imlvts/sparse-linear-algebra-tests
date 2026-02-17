@@ -680,6 +680,96 @@ mod tests {
     }
 
     #[test]
+    fn bench_repeated_exponentiation() {
+        use crate::graph_csr::CsrMatrix;
+        use rand::prelude::StdRng;
+        use rand::SeedableRng;
+        use std::time::Instant;
+
+        let mut rng = StdRng::from_seed([42; 32]);
+        let s = 30;
+        let target_epn = 3.0;
+        let max_steps = 7;
+        const ITERS: u32 = 3;
+
+        let full_csr = CsrMatrix::lattice(&[s, s, s], true);
+        let full_magnus = MagnusMatrix::lattice(&[s, s, s], true);
+        let n = full_csr.n;
+        let full_epn = full_csr.nnz() as f64 / n as f64;
+        let density = target_epn / full_epn;
+
+        let a_csr = full_csr.thin(&mut rng, density);
+        let mut triplets: Vec<(usize, usize, u64)> = Vec::new();
+        for r in 0..n {
+            let start = a_csr.row_ptr[r];
+            let end = a_csr.row_ptr[r + 1];
+            for idx in start..end {
+                triplets.push((r, a_csr.col_idx[idx], a_csr.values[idx]));
+            }
+        }
+        let mut t2 = triplets.clone();
+        let a_magnus = MagnusMatrix::from_coo(n, &mut t2);
+
+        let actual_epn = a_csr.nnz() as f64 / n as f64;
+        println!();
+        println!("Repeated exponentiation: {s}x{s}x{s} torus, {n} nodes, {:.1} e/n, {} nnz", actual_epn, a_csr.nnz());
+        println!("step,nnz,csr_us,csr_par_us,magnus_seq_us,magnus_par_us,x_csr_par,x_magnus_seq,x_magnus_par");
+
+        // Step 1 = A itself (no multiply)
+        let mut powers_csr = vec![a_csr.clone()];
+        let mut powers_magnus = vec![a_magnus.clone()];
+
+        for step in 2..=max_steps {
+            // Compute A^step = A^(step-1) * A
+            let prev_csr = &powers_csr[step - 2];
+            let prev_magnus = &powers_magnus[step - 2];
+
+            // Warmup + correctness
+            let r_csr = prev_csr.matmul(&a_csr);
+            let r_par = prev_csr.matmul_par(&a_csr);
+            let r_mseq = prev_magnus.matmul_seq(&a_magnus);
+            let r_mpar = prev_magnus.matmul(&a_magnus);
+
+            assert_eq!(r_csr.nnz(), r_par.nnz(), "step {step}: csr vs csr_par nnz");
+            assert_eq!(r_csr.nnz(), r_mseq.nnz(), "step {step}: csr vs magnus_seq nnz");
+            assert_eq!(r_csr.nnz(), r_mpar.nnz(), "step {step}: csr vs magnus_par nnz");
+
+            let nnz = r_csr.nnz();
+
+            // Timed runs
+            let t0 = Instant::now();
+            for _ in 0..ITERS { let _ = prev_csr.matmul(&a_csr); }
+            let t_csr = t0.elapsed().as_micros() / ITERS as u128;
+
+            let t0 = Instant::now();
+            for _ in 0..ITERS { let _ = prev_csr.matmul_par(&a_csr); }
+            let t_par = t0.elapsed().as_micros() / ITERS as u128;
+
+            let t0 = Instant::now();
+            for _ in 0..ITERS { let _ = prev_magnus.matmul_seq(&a_magnus); }
+            let t_mseq = t0.elapsed().as_micros() / ITERS as u128;
+
+            let t0 = Instant::now();
+            for _ in 0..ITERS { let _ = prev_magnus.matmul(&a_magnus); }
+            let t_mpar = t0.elapsed().as_micros() / ITERS as u128;
+
+            let x = |base: u128, t: u128| -> String {
+                if t > 0 { format!("{:.4}", base as f64 / t as f64) } else { "inf".to_string() }
+            };
+
+            println!(
+                "{step},{nnz},{t_csr},{t_par},{t_mseq},{t_mpar},{},{},{}",
+                x(t_csr, t_par),
+                x(t_csr, t_mseq),
+                x(t_csr, t_mpar),
+            );
+
+            powers_csr.push(r_csr);
+            powers_magnus.push(r_mseq);
+        }
+    }
+
+    #[test]
     fn bench_matmul_magnus() {
         use crate::graph::SparseCountMatrix;
         use crate::graph_csr::CsrMatrix;
