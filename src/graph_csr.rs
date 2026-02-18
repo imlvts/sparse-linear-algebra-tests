@@ -1008,7 +1008,7 @@ mod tests {
 
             loop {
                 // Enable progress for ogbn_arxiv squaring #3
-                let want_progress = name == "ogbn_arxiv" && squarings == 1;
+                let want_progress = name == "ogbn_arxiv" && squarings >= 1;
                 MATMUL_PROGRESS.store(want_progress, Ordering::Relaxed);
 
                 let t0 = Instant::now();
