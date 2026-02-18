@@ -1,3 +1,5 @@
+extern crate blas_src;
+
 pub mod traits;
 pub mod dense;
 pub mod sparse;

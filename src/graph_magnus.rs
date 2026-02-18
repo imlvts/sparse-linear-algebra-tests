@@ -680,10 +680,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any())]
     #[cfg(feature = "long-tests")]
     fn bench_repeated_exponentiation() {
-        use crate::graph_csr::CsrMatrix;
+        use crate::graph_csr::{CsrMatrix, Val};
         use rand::prelude::StdRng;
         use rand::SeedableRng;
         use std::time::Instant;
@@ -706,7 +705,7 @@ mod tests {
             let start = a_csr.row_ptr[r];
             let end = a_csr.row_ptr[r + 1];
             for idx in start..end {
-                triplets.push((r, a_csr.col_idx[idx] as usize, a_csr.values[idx]));
+                triplets.push((r, a_csr.col_idx[idx] as usize, a_csr.values[idx] as u64));
             }
         }
         let mut t2 = triplets.clone();
@@ -772,11 +771,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any())]
     #[cfg(feature = "long-tests")]
     fn bench_matmul_magnus() {
         use crate::graph::SparseCountMatrix;
-        use crate::graph_csr::CsrMatrix;
+        use crate::graph_csr::{CsrMatrix, Val};
         use crate::graph_sprs::SprsMatrix;
         use rand::prelude::StdRng;
         use rand::SeedableRng;
@@ -815,8 +813,8 @@ mod tests {
                 let a_csr = if density >= 1.0 {
                     full_csr.clone()
                 } else {
-                    let mut t: Vec<(u32, u32, u64)> = triplets_u64.iter()
-                        .map(|&(r, c, v)| (r as u32, c as u32, v)).collect();
+                    let mut t: Vec<(u32, u32, Val)> = triplets_u64.iter()
+                        .map(|&(r, c, v)| (r as u32, c as u32, v as Val)).collect();
                     CsrMatrix::from_coo(n as u32, &mut t)
                 };
 
@@ -855,9 +853,9 @@ mod tests {
                 assert_eq!(r_csr.nnz(), r_magnus_par.nnz(), "nnz mismatch: csr vs magnus_par (s={s}, epn={epn})");
                 for i in 0..n.min(10) {
                     for j in 0..n.min(10) {
-                        let v_csr = r_csr.get(i as u32, j as u32);
+                        let v_csr = r_csr.get(i as u32, j as u32) as u64;
                         assert_eq!(r_bt.get(i, j), v_csr, "btree vs csr at ({i},{j})");
-                        assert_eq!(r_par.get(i as u32, j as u32), v_csr, "csr_par vs csr at ({i},{j})");
+                        assert_eq!(r_par.get(i as u32, j as u32) as u64, v_csr, "csr_par vs csr at ({i},{j})");
                         assert_eq!(r_sprs.get(i, j), v_csr, "sprs vs csr at ({i},{j})");
                         assert_eq!(r_magnus_seq.get(i, j), v_csr, "magnus_seq vs csr at ({i},{j})");
                         assert_eq!(r_magnus_par.get(i, j), v_csr, "magnus_par vs csr at ({i},{j})");

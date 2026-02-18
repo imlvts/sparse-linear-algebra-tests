@@ -47,6 +47,8 @@ pub struct CsrMatrix {
     pub col_idx: Vec<NodeId>,
     /// Corresponding non-zero values
     pub values: Vec<Val>,
+    /// Permutation mapping: perm[new_index] = old_index. Set by `rcm()` / `permute()`.
+    pub perm: Option<Vec<NodeId>>,
 }
 
 impl CsrMatrix {
@@ -57,6 +59,7 @@ impl CsrMatrix {
             row_ptr: vec![0; n as usize + 1],
             col_idx: Vec::new(),
             values: Vec::new(),
+            perm: None,
         }
     }
 
@@ -72,7 +75,7 @@ impl CsrMatrix {
             values.push(1);
         }
         row_ptr.push(nu);
-        Self { n, row_ptr, col_idx, values }
+        Self { n, row_ptr, col_idx, values, perm: None }
     }
 
     /// Build CSR from COO triplets. Sorts by (row, col), merges duplicates by summing.
@@ -120,6 +123,7 @@ impl CsrMatrix {
             row_ptr: final_row_ptr,
             col_idx: final_col,
             values: final_val,
+            perm: None,
         }
     }
 
@@ -293,7 +297,7 @@ impl CsrMatrix {
             row_ptr.push(col_idx.len());
         }
 
-        Self { n, row_ptr, col_idx, values }
+        Self { n, row_ptr, col_idx, values, perm: None }
     }
 
     /// Matrix multiply: self × other, using a dense Vec<Val> accumulator per row.
@@ -337,7 +341,7 @@ impl CsrMatrix {
             row_ptr.push(col_idx.len());
         }
 
-        Self { n, row_ptr, col_idx, values }
+        Self { n, row_ptr, col_idx, values, perm: None }
     }
 
     /// Parallel matrix multiply using rayon. Two-pass symbolic+numeric:
@@ -475,7 +479,7 @@ impl CsrMatrix {
                 nu as f64 / elapsed);
         }
 
-        Self { n, row_ptr, col_idx, values }
+        Self { n, row_ptr, col_idx, values, perm: None }
     }
 
     /// Element-wise addition via sorted merge of each row.
@@ -533,7 +537,7 @@ impl CsrMatrix {
             row_ptr.push(col_idx.len());
         }
 
-        Self { n, row_ptr, col_idx, values }
+        Self { n, row_ptr, col_idx, values, perm: None }
     }
 
     /// Compute A + A^2 + ... until sparsity pattern stabilizes.
@@ -649,6 +653,167 @@ impl CsrMatrix {
     pub fn num_components(&self) -> usize {
         let comp = self.connected_components_uf();
         comp.iter().copied().max().map_or(0, |m| m + 1)
+    }
+
+    /// Reverse Cuthill-McKee reordering. Returns a new matrix with rows/columns
+    /// reordered to reduce bandwidth. The permutation is stored in `perm`.
+    /// Reverse Cuthill-McKee reordering in place. Reduces bandwidth.
+    /// Stores the permutation in `self.perm`.
+    pub fn rcm(&mut self) {
+        let nu = self.n as usize;
+        let mut visited = vec![false; nu];
+        let mut order: Vec<NodeId> = Vec::with_capacity(nu);
+
+        let deg = |node: usize| self.row_ptr[node + 1] - self.row_ptr[node];
+
+        for seed in 0..nu {
+            if visited[seed] { continue; }
+
+            // First BFS from seed to find a pseudo-peripheral node
+            let start = {
+                let mut queue = std::collections::VecDeque::new();
+                queue.push_back(seed);
+                let mut last = seed;
+                let mut vis2 = vec![false; nu];
+                vis2[seed] = true;
+                while let Some(u) = queue.pop_front() {
+                    last = u;
+                    let s = self.row_ptr[u];
+                    let e = self.row_ptr[u + 1];
+                    for idx in s..e {
+                        let v = self.col_idx[idx] as usize;
+                        if !vis2[v] {
+                            vis2[v] = true;
+                            queue.push_back(v);
+                        }
+                    }
+                }
+                last
+            };
+
+            // BFS from `start`, neighbors sorted by ascending degree
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(start);
+            visited[start] = true;
+            while let Some(u) = queue.pop_front() {
+                order.push(u as NodeId);
+                let s = self.row_ptr[u];
+                let e = self.row_ptr[u + 1];
+                let mut nbrs: Vec<usize> = Vec::with_capacity(e - s);
+                for idx in s..e {
+                    let v = self.col_idx[idx] as usize;
+                    if !visited[v] {
+                        nbrs.push(v);
+                    }
+                }
+                nbrs.sort_unstable_by_key(|&v| deg(v));
+                for v in nbrs {
+                    if !visited[v] {
+                        visited[v] = true;
+                        queue.push_back(v);
+                    }
+                }
+            }
+        }
+
+        order.reverse();
+        self.permute(&order);
+    }
+
+    /// Reorder rows and columns in place by a permutation. `perm[new] = old`.
+    /// Stores the permutation in `self.perm`.
+    pub fn permute(&mut self, perm: &[NodeId]) {
+        let nu = self.n as usize;
+        let nnz = self.nnz();
+        assert_eq!(perm.len(), nu);
+
+        // Build inverse: inv[old] = new
+        let mut inv = vec![0 as NodeId; nu];
+        for (new_idx, &old) in perm.iter().enumerate() {
+            inv[old as usize] = new_idx as NodeId;
+        }
+
+        // Count entries per new row
+        let mut new_row_ptr = vec![0usize; nu + 1];
+        for old_r in 0..nu {
+            let count = self.row_ptr[old_r + 1] - self.row_ptr[old_r];
+            new_row_ptr[inv[old_r] as usize + 1] = count;
+        }
+        // Prefix sum
+        for i in 1..=nu {
+            new_row_ptr[i] += new_row_ptr[i - 1];
+        }
+
+        // Scatter into new arrays
+        let mut new_col = vec![0 as NodeId; nnz];
+        let mut new_val = vec![0 as Val; nnz];
+        let mut cursor = new_row_ptr[..nu].to_vec(); // write position per new row
+        for old_r in 0..nu {
+            let new_r = inv[old_r] as usize;
+            let s = self.row_ptr[old_r];
+            let e = self.row_ptr[old_r + 1];
+            for idx in s..e {
+                let pos = cursor[new_r];
+                new_col[pos] = inv[self.col_idx[idx] as usize];
+                new_val[pos] = self.values[idx];
+                cursor[new_r] += 1;
+            }
+        }
+
+        // Sort columns within each new row (col and val together, in place)
+        let mut pairs: Vec<(NodeId, Val)> = Vec::new();
+        for r in 0..nu {
+            let s = new_row_ptr[r];
+            let e = new_row_ptr[r + 1];
+            if e - s <= 1 { continue; }
+            pairs.clear();
+            pairs.extend(new_col[s..e].iter().copied()
+                .zip(new_val[s..e].iter().copied()));
+            pairs.sort_unstable_by_key(|&(c, _)| c);
+            for (i, &(c, v)) in pairs.iter().enumerate() {
+                new_col[s + i] = c;
+                new_val[s + i] = v;
+            }
+        }
+
+        self.row_ptr = new_row_ptr;
+        self.col_idx = new_col;
+        self.values = new_val;
+        self.perm = Some(perm.to_vec());
+    }
+
+    /// Undo the stored permutation in place, restoring original index order.
+    /// No-op if `perm` is `None`.
+    pub fn unpermute(&mut self) {
+        let Some(perm) = self.perm.take() else { return; };
+        let nu = self.n as usize;
+
+        // perm[new] = old → inverse: inv[old] = new
+        let mut inv = vec![0 as NodeId; nu];
+        for (new_idx, &old) in perm.iter().enumerate() {
+            inv[old as usize] = new_idx as NodeId;
+        }
+        self.permute(&inv);
+        self.perm = None;
+    }
+
+    /// Bandwidth stats: returns (max |r-c|, avg |r-c|) over all nonzeros.
+    pub fn bandwidth_stats(&self) -> (usize, f64) {
+        let mut max_bw: usize = 0;
+        let mut sum_bw: u64 = 0;
+        let mut count: u64 = 0;
+        for r in 0..self.n as usize {
+            let s = self.row_ptr[r];
+            let e = self.row_ptr[r + 1];
+            for idx in s..e {
+                let c = self.col_idx[idx] as usize;
+                let d = if r > c { r - c } else { c - r };
+                max_bw = max_bw.max(d);
+                sum_bw += d as u64;
+                count += 1;
+            }
+        }
+        (max_bw, sum_bw as f64 / count.max(1) as f64)
     }
 
     /// Print (for small matrices).
@@ -901,6 +1066,47 @@ mod tests {
     }
 
     #[test]
+    fn test_rcm_unpermute_roundtrip() {
+        // Small graph
+        let orig = CsrMatrix::from_edges_undirected(6, &[
+            (0, 3), (1, 4), (2, 5), (0, 1), (3, 4),
+        ]);
+        let mut m = orig.clone();
+        m.rcm();
+        assert!(m.perm.is_some());
+        m.unpermute();
+        assert!(m.perm.is_none());
+        assert_eq!(m.row_ptr, orig.row_ptr);
+        assert_eq!(m.col_idx, orig.col_idx);
+        assert_eq!(m.values, orig.values);
+    }
+
+    #[test]
+    fn test_rcm_unpermute_lattice() {
+        let orig = CsrMatrix::lattice(&[4, 4], false);
+        let mut m = orig.clone();
+        m.rcm();
+        m.unpermute();
+        assert_eq!(m.row_ptr, orig.row_ptr);
+        assert_eq!(m.col_idx, orig.col_idx);
+        assert_eq!(m.values, orig.values);
+    }
+
+    #[test]
+    fn test_rcm_unpermute_directed() {
+        // Directed graph (asymmetric) — rcm + unpermute must still round-trip
+        let orig = CsrMatrix::from_edges(5, &[
+            (0, 1), (1, 2), (2, 3), (3, 4), (4, 0), (0, 3),
+        ]);
+        let mut m = orig.clone();
+        m.rcm();
+        m.unpermute();
+        assert_eq!(m.row_ptr, orig.row_ptr);
+        assert_eq!(m.col_idx, orig.col_idx);
+        assert_eq!(m.values, orig.values);
+    }
+
+    #[test]
     #[cfg(feature = "long-tests")]
     fn bench_matmul_btree_vs_csr() {
         use crate::graph::SparseCountMatrix;
@@ -1076,6 +1282,110 @@ mod tests {
 
     #[test]
     #[cfg(feature = "long-tests")]
+    fn bench_real_graphs_dense() {
+        use std::time::Instant;
+
+        // Let OpenBLAS use all cores
+        let ncpus = std::thread::available_parallelism()
+            .map(|p| p.get().to_string())
+            .unwrap_or_else(|_| "1".to_string());
+        unsafe {
+            std::env::set_var("OPENBLAS_NUM_THREADS", &ncpus);
+            std::env::set_var("OMP_NUM_THREADS", &ncpus);
+        }
+        println!("OPENBLAS_NUM_THREADS={ncpus}, OMP_NUM_THREADS={ncpus}");
+
+        let graphs = &[
+            ("cora", "gen-graphs/cora.edges"),
+            ("nell", "gen-graphs/nell.edges"),
+            ("ogbn_arxiv", "gen-graphs/ogbn_arxiv.edges"),
+        ];
+
+        const MAX_POWER: usize = 14;
+        // Dense n×n uses n² × 4 bytes. Cap at ~120 GB.
+        // const MAX_DENSE_BYTES: usize = 120_000_000_000;
+        // 500 gb for big boy
+        const MAX_DENSE_BYTES: usize = 500_000_000_000;
+
+        /// CSR → dense f64 row-major (n×n).
+        fn csr_to_dense_f64(m: &CsrMatrix) -> Vec<f64> {
+            let nu = m.n as usize;
+            let mut d = vec![0.0f64; nu * nu];
+            for r in 0..nu {
+                let s = m.row_ptr[r];
+                let e = m.row_ptr[r + 1];
+                for idx in s..e {
+                    d[r * nu + m.col_idx[idx] as usize] = m.values[idx] as f64;
+                }
+            }
+            d
+        }
+
+        /// Dense matmul via BLAS dgemm: C = A × B, all n×n row-major.
+        /// Writes into pre-allocated `c` (zeroed by caller or overwritten by beta=0).
+        fn dense_matmul_blas(a: &[f64], b: &[f64], c: &mut [f64], n: usize) {
+            let ni = n as i32;
+            // BLAS is column-major. For row-major A×B=C, compute B^T × A^T = C^T
+            // which in BLAS column-major view is: C_col = B_col * A_col with no-trans.
+            // Equivalently: use (b, a) order with no-trans flags.
+            unsafe {
+                blas::dgemm(
+                    b'N',        // transA (B in row-major)
+                    b'N',        // transB (A in row-major)
+                    ni,          // m = rows of op(A) = n
+                    ni,          // n = cols of op(B) = n
+                    ni,          // k = inner dim = n
+                    1.0,         // alpha
+                    b, ni,       // B as col-major
+                    a, ni,       // A as col-major
+                    0.0,         // beta
+                    c, ni,       // C as col-major
+                );
+            }
+        }
+
+        /// Count non-zeros in dense f64 matrix.
+        fn dense_nnz(d: &[f64]) -> usize {
+            d.iter().filter(|&&v| v != 0.0).count()
+        }
+
+        println!();
+        println!("graph,nodes,edges,step,nnz_out,dense_us");
+
+        for &(name, path) in graphs {
+            println!("doing graph {name}");
+            let (n, edges) = load_edges(path);
+            let nu = n as usize;
+            let mat_bytes = nu * nu * std::mem::size_of::<f64>();
+            if mat_bytes > MAX_DENSE_BYTES {
+                println!("{name},{n},{},—,—,— (skipped: {:.1} GB dense)",
+                    edges.len(), mat_bytes as f64 / 1e9);
+                continue;
+            }
+
+            let a_csr = CsrMatrix::from_edges(n, &edges);
+            println!("loaded csr");
+            let a_dense = csr_to_dense_f64(&a_csr);
+            println!("converted to dense");
+            let mut prev = a_dense.clone();
+            let mut result = vec![0.0f64; nu * nu];
+
+            println!("starting matmul");
+            for step in 2..=MAX_POWER {
+                let t0 = Instant::now();
+                dense_matmul_blas(&prev, &a_dense, &mut result, nu);
+                let t_us = t0.elapsed().as_micros();
+                let nnz_out = dense_nnz(&result);
+
+                println!("{name},{n},{},{step},{nnz_out},{t_us}", edges.len());
+
+                std::mem::swap(&mut prev, &mut result);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "long-tests")]
     fn bench_real_graphs() {
         use std::time::Instant;
 
@@ -1116,6 +1426,104 @@ mod tests {
                     break;
                 }
             }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "long-tests")]
+    fn analyze_graph_structure() {
+        use std::time::Instant;
+
+        let graphs = &[
+            ("cora", "gen-graphs/cora.edges"),
+            ("nell", "gen-graphs/nell.edges"),
+            ("ogbn_arxiv", "gen-graphs/ogbn_arxiv.edges"),
+        ];
+
+        println!();
+        for &(name, path) in graphs {
+            let (n, edges) = load_edges(path);
+            let a = CsrMatrix::from_edges_undirected(n, &edges);
+            let nu = n as usize;
+
+            // Connected components
+            let comp = a.connected_components_uf();
+            let num_comp = comp.iter().copied().max().map_or(0, |m| m + 1);
+            let mut sizes = vec![0usize; num_comp];
+            for &c in &comp {
+                sizes[c] += 1;
+            }
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+
+            // Degree stats
+            let mut degrees: Vec<usize> = (0..nu).map(|r| a.row_ptr[r + 1] - a.row_ptr[r]).collect();
+            degrees.sort_unstable();
+            let min_deg = degrees[0];
+            let max_deg = degrees[nu - 1];
+            let median_deg = degrees[nu / 2];
+            let avg_deg = a.nnz() as f64 / nu as f64;
+
+            // Bandwidth before RCM
+            let (max_bw, avg_bw) = a.bandwidth_stats();
+
+            // RCM
+            let t0 = Instant::now();
+            let mut a_rcm = a.clone();
+            a_rcm.rcm();
+            let t_rcm = t0.elapsed().as_millis();
+            let (max_bw_rcm, avg_bw_rcm) = a_rcm.bandwidth_stats();
+
+            println!("[{name}]");
+            println!("  nodes: {nu}, edges: {}, nnz(undirected): {}", edges.len(), a.nnz());
+            println!("  components: {num_comp}");
+            if num_comp <= 20 {
+                println!("  sizes: {:?}", &sizes);
+            } else {
+                println!("  top 10 sizes: {:?}  ... ({} singletons)",
+                    &sizes[..10.min(sizes.len())],
+                    sizes.iter().filter(|&&s| s == 1).count());
+            }
+            println!("  degree: min={min_deg}, median={median_deg}, avg={avg_deg:.1}, max={max_deg}");
+            println!("  bandwidth (original): max={max_bw}, avg={avg_bw:.1}");
+            println!("  bandwidth (RCM):      max={max_bw_rcm}, avg={avg_bw_rcm:.1}  ({t_rcm} ms)");
+            println!("  reduction:            max {:.1}×, avg {:.1}×",
+                max_bw as f64 / max_bw_rcm.max(1) as f64,
+                avg_bw / avg_bw_rcm.max(0.001));
+
+            // Bench A² original vs RCM (directed graph, reuse undirected perm)
+            let mut a_dir_rcm = CsrMatrix::from_edges(n, &edges);
+            a_dir_rcm.permute(a_rcm.perm.as_ref().unwrap());
+            let a_dir = CsrMatrix::from_edges(n, &edges);
+
+            // Warmup
+            let _ = a_dir.matmul_par(&a_dir);
+            let _ = a_dir_rcm.matmul_par(&a_dir_rcm);
+
+            // matmul (single-threaded)
+            let t0 = Instant::now();
+            let r_orig = a_dir.matmul(&a_dir);
+            let t_st_orig = t0.elapsed().as_millis();
+
+            let t0 = Instant::now();
+            let r_rcm = a_dir_rcm.matmul(&a_dir_rcm);
+            let t_st_rcm = t0.elapsed().as_millis();
+
+            assert_eq!(r_orig.nnz(), r_rcm.nnz(), "nnz mismatch after RCM");
+
+            // matmul_par
+            let t0 = Instant::now();
+            let _ = a_dir.matmul_par(&a_dir);
+            let t_par_orig = t0.elapsed().as_millis();
+
+            let t0 = Instant::now();
+            let _ = a_dir_rcm.matmul_par(&a_dir_rcm);
+            let t_par_rcm = t0.elapsed().as_millis();
+
+            println!("  A² matmul     (1T):  orig {t_st_orig} ms, rcm {t_st_rcm} ms  ({:.2}×)",
+                t_st_orig as f64 / t_st_rcm.max(1) as f64);
+            println!("  A² matmul_par (MT):  orig {t_par_orig} ms, rcm {t_par_rcm} ms  ({:.2}×)",
+                t_par_orig as f64 / t_par_rcm.max(1) as f64);
+            println!();
         }
     }
 }
