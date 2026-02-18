@@ -12,6 +12,9 @@ pub static MATMUL_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Node index type — u32 suffices for < 4 billion nodes and halves col_idx memory.
 pub type NodeId = u32;
 
+/// Value type for matrix entries. u32 halves memory vs u64; change to u64 if counts overflow.
+pub type Val = u32;
+
 /// Wrapper to send a raw pointer across threads.
 /// SAFETY: caller must guarantee disjoint access from each thread.
 #[derive(Clone, Copy)]
@@ -23,12 +26,12 @@ impl<T> SendPtr<T> {
 }
 
 #[inline(always)]
-fn sadd(a: u64, b: u64) -> u64 {
+fn sadd(a: Val, b: Val) -> Val {
     (Saturating(a) + Saturating(b)).0
 }
 
 #[inline(always)]
-fn smul(a: u64, b: u64) -> u64 {
+fn smul(a: Val, b: Val) -> Val {
     (Saturating(a) * Saturating(b)).0
 }
 
@@ -43,7 +46,7 @@ pub struct CsrMatrix {
     /// Column indices (sorted within each row)
     pub col_idx: Vec<NodeId>,
     /// Corresponding non-zero values
-    pub values: Vec<u64>,
+    pub values: Vec<Val>,
 }
 
 impl CsrMatrix {
@@ -73,14 +76,14 @@ impl CsrMatrix {
     }
 
     /// Build CSR from COO triplets. Sorts by (row, col), merges duplicates by summing.
-    pub fn from_coo(n: NodeId, triplets: &mut Vec<(NodeId, NodeId, u64)>) -> Self {
+    pub fn from_coo(n: NodeId, triplets: &mut Vec<(NodeId, NodeId, Val)>) -> Self {
         let nu = n as usize;
         triplets.sort_unstable_by_key(|&(r, c, _)| (r, c));
 
         // Deduplicate and merge
         let mut prev_row = NodeId::MAX;
         let mut prev_col = NodeId::MAX;
-        let mut deduped: Vec<(NodeId, NodeId, u64)> = Vec::with_capacity(triplets.len());
+        let mut deduped: Vec<(NodeId, NodeId, Val)> = Vec::with_capacity(triplets.len());
         for &(r, c, v) in triplets.iter() {
             if r == prev_row && c == prev_col {
                 deduped.last_mut().unwrap().2 += v;
@@ -122,13 +125,13 @@ impl CsrMatrix {
 
     /// Build from directed edge list.
     pub fn from_edges(n: NodeId, edges: &[(NodeId, NodeId)]) -> Self {
-        let mut triplets: Vec<(NodeId, NodeId, u64)> = edges.iter().map(|&(r, c)| (r, c, 1)).collect();
+        let mut triplets: Vec<(NodeId, NodeId, Val)> = edges.iter().map(|&(r, c)| (r, c, 1)).collect();
         Self::from_coo(n, &mut triplets)
     }
 
     /// Build from edge list, making it undirected (symmetric).
     pub fn from_edges_undirected(n: NodeId, edges: &[(NodeId, NodeId)]) -> Self {
-        let mut triplets: Vec<(NodeId, NodeId, u64)> = Vec::with_capacity(edges.len() * 2);
+        let mut triplets: Vec<(NodeId, NodeId, Val)> = Vec::with_capacity(edges.len() * 2);
         for &(r, c) in edges {
             triplets.push((r, c, 1));
             if r != c {
@@ -155,7 +158,7 @@ impl CsrMatrix {
     pub fn random(rng: &mut impl Rng, n: NodeId, m: usize) -> Self {
         let nu = n as usize;
         assert!(nu >= 2, "need at least 2 nodes to avoid self-loops");
-        let mut triplets: Vec<(NodeId, NodeId, u64)> = Vec::with_capacity(m);
+        let mut triplets: Vec<(NodeId, NodeId, Val)> = Vec::with_capacity(m);
         for _ in 0..m {
             let r = rng.random_range(0..nu);
             let c = rng.random_range(0..nu - 1);
@@ -201,7 +204,7 @@ impl CsrMatrix {
                     neighbor += c * strides[d];
                 }
                 if all_zero || !valid { continue; }
-                triplets.push((node as NodeId, neighbor as NodeId, 1u64));
+                triplets.push((node as NodeId, neighbor as NodeId, 1 as Val));
             }
 
             for d in (0..ndim).rev() {
@@ -239,7 +242,7 @@ impl CsrMatrix {
     }
 
     /// Lookup value at (r, c) via binary search.
-    pub fn get(&self, r: NodeId, c: NodeId) -> u64 {
+    pub fn get(&self, r: NodeId, c: NodeId) -> Val {
         let start = self.row_ptr[r as usize];
         let end = self.row_ptr[r as usize + 1];
         match self.col_idx[start..end].binary_search(&c) {
@@ -254,7 +257,7 @@ impl CsrMatrix {
     }
 
     /// Iterate over non-zero entries in row r: yields (col, value).
-    pub fn row_iter(&self, r: NodeId) -> impl Iterator<Item = (NodeId, u64)> + '_ {
+    pub fn row_iter(&self, r: NodeId) -> impl Iterator<Item = (NodeId, Val)> + '_ {
         let start = self.row_ptr[r as usize];
         let end = self.row_ptr[r as usize + 1];
         self.col_idx[start..end].iter().zip(&self.values[start..end])
@@ -274,7 +277,7 @@ impl CsrMatrix {
         row_ptr.push(0);
 
         for i in 0..n {
-            let mut acc: BTreeMap<NodeId, u64> = BTreeMap::new();
+            let mut acc: BTreeMap<NodeId, Val> = BTreeMap::new();
             for (k, a_ik) in self.row_iter(i) {
                 for (j, b_kj) in other.row_iter(k) {
                     let e = acc.entry(j).or_insert(0);
@@ -293,7 +296,7 @@ impl CsrMatrix {
         Self { n, row_ptr, col_idx, values }
     }
 
-    /// Matrix multiply: self × other, using a dense Vec<u64> accumulator per row.
+    /// Matrix multiply: self × other, using a dense Vec<Val> accumulator per row.
     /// O(flops + n * active_rows) time, O(n) scratch space.
     pub fn matmul(&self, other: &Self) -> Self {
         assert_eq!(self.n, other.n);
@@ -305,7 +308,7 @@ impl CsrMatrix {
         let mut values = Vec::new();
         row_ptr.push(0);
 
-        let mut acc = vec![0u64; nu];
+        let mut acc = vec![0 as Val; nu];
         let mut nz_cols: Vec<NodeId> = Vec::new();
 
         for i in 0..n {
@@ -410,7 +413,7 @@ impl CsrMatrix {
 
         // Allocate output arrays exactly
         let mut col_idx = vec![0 as NodeId; total_nnz];
-        let mut values = vec![0u64; total_nnz];
+        let mut values = vec![0 as Val; total_nnz];
 
         // Pass 2: numeric — fill col_idx and values in parallel
         // SAFETY: each row writes to a disjoint slice [row_ptr[i]..row_ptr[i+1]]
@@ -420,7 +423,7 @@ impl CsrMatrix {
         let out_v = SendPtr(values.as_mut_ptr());
 
         (0..nu).into_par_iter().for_each_init(
-            || (vec![0u64; nu], Vec::<NodeId>::new()),
+            || (vec![0 as Val; nu], Vec::<NodeId>::new()),
             |(acc, nz_cols), i| {
                 let a_start = self.row_ptr[i];
                 let a_end = self.row_ptr[i + 1];
@@ -927,8 +930,8 @@ mod tests {
                 let a_csr = if density >= 1.0 {
                     full_csr.clone()
                 } else {
-                    let mut triplets: Vec<(NodeId, NodeId, u64)> = a_bt.entries.iter()
-                        .map(|(&(r, c), &v)| (r as NodeId, c as NodeId, v)).collect();
+                    let mut triplets: Vec<(NodeId, NodeId, Val)> = a_bt.entries.iter()
+                        .map(|(&(r, c), &v)| (r as NodeId, c as NodeId, v as Val)).collect();
                     CsrMatrix::from_coo(n as NodeId, &mut triplets)
                 };
                 let b_csr = a_csr.clone();
@@ -1088,7 +1091,7 @@ mod tests {
         println!();
         println!("graph,nodes,edges,step,nnz_out,csr_par_us");
 
-        // Each nnz costs 12 bytes (col_idx u32 + value u64). matmul_par holds prev + A + result
+        // Each nnz costs 8 bytes (col_idx u32 + value u32). matmul_par holds prev + A + result
         // + per-thread scratch, so budget ~3× output size. 2B nnz ≈ 24 GB × 3 ≈ 72 GB.
         const MAX_NNZ: usize = 4_400_000_000; // !!
 
