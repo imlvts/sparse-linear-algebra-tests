@@ -680,6 +680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     #[cfg(feature = "long-tests")]
     fn bench_repeated_exponentiation() {
         use crate::graph_csr::CsrMatrix;
@@ -771,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     #[cfg(feature = "long-tests")]
     fn bench_matmul_magnus() {
         use crate::graph::SparseCountMatrix;

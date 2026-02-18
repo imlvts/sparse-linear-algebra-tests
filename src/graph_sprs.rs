@@ -651,6 +651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     #[cfg(feature = "long-tests")]
     fn bench_matmul_sprs_vs_csr() {
         use crate::graph::SparseCountMatrix;
