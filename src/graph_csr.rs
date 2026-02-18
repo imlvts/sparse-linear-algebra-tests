@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 use rand::Rng;
 use rayon::prelude::*;
 
 use std::num::Saturating;
+
+/// Set to `true` to make `matmul_par` print row-progress to stderr.
+pub static MATMUL_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Node index type — u32 suffices for < 4 billion nodes and halves col_idx memory.
 pub type NodeId = u32;
@@ -339,7 +344,13 @@ impl CsrMatrix {
         let n = self.n;
         let nu = n as usize;
 
+        let progress = MATMUL_PROGRESS.load(Ordering::Relaxed);
+        let rows_done = AtomicUsize::new(0);
+        let rows_done_ref = &rows_done;
+        let print_interval = (nu / 200).max(1); // ~0.5% granularity
+
         // Pass 1: symbolic — count nnz per output row
+        let pass_start = Instant::now();
         let mut nnz_per_row = vec![0usize; nu];
         nnz_per_row.par_iter_mut().enumerate().for_each_init(
             || vec![false; nu],
@@ -369,8 +380,25 @@ impl CsrMatrix {
                         mask[other.col_idx[jdx] as usize] = false;
                     }
                 }
+
+                if progress {
+                    let done = rows_done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % print_interval == 0 || done == nu {
+                        let elapsed = pass_start.elapsed().as_secs_f64();
+                        let rps = done as f64 / elapsed;
+                        let eta = (nu - done) as f64 / rps;
+                        eprint!("\r  symbolic: {done}/{nu} ({:.1}%)  {rps:.0} rows/s  ETA {eta:.1}s   ",
+                            done as f64 / nu as f64 * 100.0);
+                    }
+                }
             },
         );
+        if progress {
+            let elapsed = pass_start.elapsed().as_secs_f64();
+            eprintln!("\r  symbolic: done in {elapsed:.1}s ({:.0} rows/s)                    ",
+                nu as f64 / elapsed);
+            rows_done.store(0, Ordering::Relaxed);
+        }
 
         // Build row_ptr from nnz counts
         let mut row_ptr = Vec::with_capacity(nu + 1);
@@ -386,13 +414,14 @@ impl CsrMatrix {
 
         // Pass 2: numeric — fill col_idx and values in parallel
         // SAFETY: each row writes to a disjoint slice [row_ptr[i]..row_ptr[i+1]]
+        let pass_start = Instant::now();
         let col_ptr = &row_ptr;
         let out_c = SendPtr(col_idx.as_mut_ptr());
         let out_v = SendPtr(values.as_mut_ptr());
 
         (0..nu).into_par_iter().for_each_init(
             || (vec![0u64; nu], Vec::<NodeId>::new()),
-            move |(acc, nz_cols), i| {
+            |(acc, nz_cols), i| {
                 let a_start = self.row_ptr[i];
                 let a_end = self.row_ptr[i + 1];
                 for idx in a_start..a_end {
@@ -424,8 +453,24 @@ impl CsrMatrix {
                     acc[j as usize] = 0;
                 }
                 nz_cols.clear();
+
+                if progress {
+                    let done = rows_done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % print_interval == 0 || done == nu {
+                        let elapsed = pass_start.elapsed().as_secs_f64();
+                        let rps = done as f64 / elapsed;
+                        let eta = (nu - done) as f64 / rps;
+                        eprint!("\r  numeric:  {done}/{nu} ({:.1}%)  {rps:.0} rows/s  ETA {eta:.1}s   ",
+                            done as f64 / nu as f64 * 100.0);
+                    }
+                }
             },
         );
+        if progress {
+            let elapsed = pass_start.elapsed().as_secs_f64();
+            eprintln!("\r  numeric:  done in {elapsed:.1}s ({:.0} rows/s)                    ",
+                nu as f64 / elapsed);
+        }
 
         Self { n, row_ptr, col_idx, values }
     }
@@ -962,18 +1007,15 @@ mod tests {
             let mut squarings = 0;
 
             loop {
+                // Enable progress for ogbn_arxiv squaring #3
+                let want_progress = name == "ogbn_arxiv" && squarings == 1;
+                MATMUL_PROGRESS.store(want_progress, Ordering::Relaxed);
+
                 let t0 = Instant::now();
                 let mut next = current.matmul_par(&current);
-                let mut off = 0;
-                if name == "nell" {
-                    // special-case: squaring is expensive, but pre-multiplying by r0 is cheap.
-                    // So do one r0 multiplication first to get a better upper bound, then square.
-                    next = next.matmul_par(&r0);
-                    off += 1;
-                }
                 let t_ms = t0.elapsed().as_millis();
                 squarings += 1;
-                let new_reach = reach * 2 + off;
+                let new_reach = reach * 2;
 
                 println!("  squaring {squarings}: reach ≤{new_reach}, nnz={}, {t_ms} ms", next.nnz());
 
@@ -985,6 +1027,7 @@ mod tests {
                     // But we need the boundary between reach and new_reach
                     // prev_saved covers ≤ reach (the pre-squaring matrix)
                     println!("  stabilised: diameter ∈ ({prev_reach}, {new_reach}]");
+                    MATMUL_PROGRESS.store(false, Ordering::Relaxed);
                     break;
                 }
 
