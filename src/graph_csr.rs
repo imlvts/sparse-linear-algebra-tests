@@ -933,6 +933,103 @@ mod tests {
 
     #[test]
     #[cfg(feature = "long-tests")]
+    fn bench_diameter() {
+        use std::time::Instant;
+
+        let graphs = &[
+            ("cora", "gen-graphs/cora.edges"),
+            // ("nell", "gen-graphs/nell.edges"),
+            ("ogbn_arxiv", "gen-graphs/ogbn_arxiv.edges"),
+        ];
+
+        println!();
+        println!("=== Diameter via repeated squaring ===");
+
+        for &(name, path) in graphs {
+            let (n, edges) = load_edges(path);
+            // Undirected + self-loops: R[i][j] > 0 ⟺ dist(i,j) ≤ 1
+            let a_sym = CsrMatrix::from_edges_undirected(n, &edges);
+            let r0 = a_sym.add(&CsrMatrix::identity(n));
+
+            println!();
+            println!("[{name}] n={n}, edges={} (undirected nnz={})", edges.len(), a_sym.nnz());
+
+            // Phase 1: repeated squaring to find upper bound
+            let mut current = r0.clone();
+            let mut reach = 1usize; // current covers distances ≤ reach
+            let mut prev_saved = r0.clone(); // last power before stabilisation
+            let mut prev_reach = 0usize;
+            let mut squarings = 0;
+
+            loop {
+                let t0 = Instant::now();
+                let mut next = current.matmul_par(&current);
+                let mut off = 0;
+                if name == "nell" {
+                    // special-case: squaring is expensive, but pre-multiplying by r0 is cheap.
+                    // So do one r0 multiplication first to get a better upper bound, then square.
+                    next = next.matmul_par(&r0);
+                    off += 1;
+                }
+                let t_ms = t0.elapsed().as_millis();
+                squarings += 1;
+                let new_reach = reach * 2 + off;
+
+                println!("  squaring {squarings}: reach ≤{new_reach}, nnz={}, {t_ms} ms", next.nnz());
+
+                if next.nnz() == current.nnz()
+                    && next.col_idx == current.col_idx
+                    && next.row_ptr == current.row_ptr
+                {
+                    // Stabilised: diameter ∈ (prev_reach, new_reach]
+                    // But we need the boundary between reach and new_reach
+                    // prev_saved covers ≤ reach (the pre-squaring matrix)
+                    println!("  stabilised: diameter ∈ ({prev_reach}, {new_reach}]");
+                    break;
+                }
+
+                prev_saved = current;
+                prev_reach = reach;
+                current = next;
+                reach = new_reach;
+            }
+
+            // Phase 2: linear refinement from prev_saved (covers ≤ prev_reach)
+            // Multiply by r0 one step at a time until stable
+            if prev_reach == 0 {
+                // Stabilised on the very first squaring: diameter ≤ 2
+                // Refine: check if A_sym + I itself was already the closure
+                if r0.nnz() == current.nnz() {
+                    println!("  diameter = 1 (or 0 if isolated nodes)");
+                } else {
+                    println!("  diameter = 2");
+                }
+            } else {
+                let mut refine = prev_saved;
+                let mut d = prev_reach;
+                loop {
+                    let t0 = Instant::now();
+                    let next = refine.matmul_par(&r0);
+                    let t_ms = t0.elapsed().as_millis();
+                    d += 1;
+
+                    println!("  refine d={d}: nnz={}, {t_ms} ms", next.nnz());
+
+                    if next.nnz() == refine.nnz()
+                        && next.col_idx == refine.col_idx
+                        && next.row_ptr == refine.row_ptr
+                    {
+                        println!("  diameter = {}", d - 1);
+                        break;
+                    }
+                    refine = next;
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "long-tests")]
     fn bench_real_graphs() {
         use std::time::Instant;
 

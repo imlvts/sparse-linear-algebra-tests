@@ -33,8 +33,10 @@ def parse_csv(text):
     reader = csv.DictReader(io.StringIO(header_line + "\n" + "\n".join(lines)))
     return list(reader)
 
+LOG_Z = True  # Set to False for linear Z axis
+
 def build_grid(rows, time_col):
-    """Build meshgrid from rows. Returns log10(X), log10(Y), log10(Z), plus raw values for tick labels."""
+    """Build meshgrid from rows. Returns log10(X), log10(Y), Z (log10 or linear), plus raw values for tick labels."""
     nodes_set = sorted(set(int(r["nodes"]) for r in rows))
     epn_set = sorted(set(float(r["e_per_n"]) for r in rows))
 
@@ -53,9 +55,9 @@ def build_grid(rows, time_col):
     logX = np.log10(X)
     logY = np.log10(Y)
     logXm, logYm = np.meshgrid(logX, logY)
-    logZ = np.log10(np.where(Z > 0, Z, np.nan))
+    Zout = np.log10(np.where(Z > 0, Z, np.nan)) if LOG_Z else Z
 
-    return logXm, logYm, logZ, X, Y
+    return logXm, logYm, Zout, X, Y
 
 def plot_pair(ax, rows, col_a, col_b, label_a, label_b, title):
     lXa, lYa, lZa, rawX, rawY = build_grid(rows, col_a)
@@ -72,13 +74,14 @@ def plot_pair(ax, rows, col_a, col_b, label_a, label_b, title):
     ax.set_yticks(np.log10(rawY))
     ax.set_yticklabels([f"{v:g}" for v in rawY], fontsize=8)
 
-    # Log-scale tick labels for Z (time ms)
-    all_z = np.concatenate([lZa.ravel(), lZb.ravel()])
-    all_z = all_z[np.isfinite(all_z)]
-    zmin, zmax = np.floor(all_z.min()), np.ceil(all_z.max())
-    zticks = np.arange(zmin, zmax + 1)
-    ax.set_zticks(zticks)
-    ax.set_zticklabels([f"{10**z:g}" for z in zticks], fontsize=8)
+    # Z-axis tick labels
+    if LOG_Z:
+        all_z = np.concatenate([lZa.ravel(), lZb.ravel()])
+        all_z = all_z[np.isfinite(all_z)]
+        zmin, zmax = np.floor(all_z.min()), np.ceil(all_z.max())
+        zticks = np.arange(zmin, zmax + 1)
+        ax.set_zticks(zticks)
+        ax.set_zticklabels([f"{10**z:g}" for z in zticks], fontsize=8)
 
     ax.set_xlabel('Nodes', fontsize=10, labelpad=8)
     ax.set_ylabel('Edges/node', fontsize=10, labelpad=8)
