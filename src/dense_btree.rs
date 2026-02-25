@@ -1,11 +1,9 @@
 const KEYS_PER_NODE: usize = 8;
-const BTREE_BRANCHES: usize = KEYS_PER_NODE + 1;
 
 pub struct DenseBTree<T: Ord> {
     data: Vec<T>,
     internal: Vec<T>,
     height: usize,
-    level_offsets: Vec<usize>,
 }
 
 impl<T: Ord + Clone> DenseBTree<T> {
@@ -19,68 +17,46 @@ impl<T: Ord + Clone> DenseBTree<T> {
         let n = data.len();
 
         if n == 0 {
-            return DenseBTree { data, internal: Vec::new(), height: 0, level_offsets: Vec::new() };
+            return DenseBTree { data, internal: Vec::new(), height: 0 };
         }
 
         let leaf_count = (n + KEYS_PER_NODE - 1) / KEYS_PER_NODE;
         if leaf_count <= 1 {
-            return DenseBTree { data, internal: Vec::new(), height: 0, level_offsets: Vec::new() };
+            return DenseBTree { data, internal: Vec::new(), height: 0 };
         }
 
         // height = smallest h such that 9^h >= leaf_count
         let mut height = 0;
         let mut span = 1usize;
+        let mut bottom_span = 1usize;
         while span < leaf_count {
-            span = span.saturating_mul(BTREE_BRANCHES);
+            span *= KEYS_PER_NODE;
+            bottom_span += span;
             height += 1;
         }
-
-        // Level sizes (top-down: level 0 = root) and byte offsets in node-count
-        let mut level_offsets = Vec::with_capacity(height);
-        let mut offset = 0usize;
-        let mut s = span;
-        for _ in 0..height {
-            let level_size = (leaf_count + s - 1) / s;
-            level_offsets.push(offset);
-            offset += level_size;
-            s /= BTREE_BRANCHES;
-        }
-        let num_internal_nodes = offset;
+        bottom_span -= span;
 
         // Pre-fill with max value (padding)
-        let mut internal = vec![data[n - 1].clone(); num_internal_nodes * KEYS_PER_NODE];
-
-        // Fill separator keys: key[k] = max element in child k's leaf range
-        let mut child_stride = span / BTREE_BRANCHES;
-        s = span;
-        for level in 0..height {
-            let level_off = level_offsets[level];
-            let level_size = if level + 1 < height {
-                level_offsets[level + 1] - level_off
-            } else {
-                num_internal_nodes - level_off
-            };
-
-            for i in 0..level_size {
-                let base = (level_off + i) * KEYS_PER_NODE;
-                let node_first_chunk = i * s;
-
-                for k in 0..KEYS_PER_NODE {
-                    let child_first = node_first_chunk + k * child_stride;
-                    if child_first >= leaf_count {
-                        break;
-                    }
-                    let child_end = (child_first + child_stride).min(leaf_count);
-                    let last_data_idx = (child_end * KEYS_PER_NODE).min(n) - 1;
-                    internal[base + k] = data[last_data_idx].clone();
+        let mut internal = vec![data[n - 1].clone(); bottom_span * KEYS_PER_NODE];
+        // Fill internal nodes with max key of each child.
+        // Each data[ii] writes to its bottom-level parent key, then propagates
+        // upward only when it's the last key in a node (key_idx == 7), since
+        // that means it's the max of the entire node's subtree.
+        for ii in 0..data.len() {
+            let datum = &data[ii];
+            let mut idx = bottom_span - 1 + ii / KEYS_PER_NODE;
+            loop {
+                internal[idx] = datum.clone();
+                if idx % KEYS_PER_NODE != KEYS_PER_NODE - 1 {
+                    break;
+                }
+                match (idx / KEYS_PER_NODE).checked_sub(1) {
+                    Some(parent) => idx = parent,
+                    None => break,
                 }
             }
-
-            s = child_stride;
-            child_stride /= BTREE_BRANCHES;
         }
-
-        DenseBTree { data, internal, height, level_offsets }
+        DenseBTree { data, internal, height }
     }
 
     pub fn index(&self, value: &T) -> Result<usize, usize> {
@@ -89,25 +65,31 @@ impl<T: Ord + Clone> DenseBTree<T> {
         if *value > self.data[n - 1] { return Err(n); }
 
         // Route through internal levels
-        let mut idx = 0usize;
+        let mut base = 0usize;
         for level in 0..self.height {
-            let base = (self.level_offsets[level] + idx) * KEYS_PER_NODE;
             let keys = &self.internal[base..base + KEYS_PER_NODE];
             let mut k = 0;
             while k < KEYS_PER_NODE && *value > keys[k] {
                 k += 1;
             }
-            idx = idx * BTREE_BRANCHES + k;
+            let child_idx = (base + k + 1) * KEYS_PER_NODE;
+            base = child_idx;
         }
+
+        base -= self.internal.len();  // convert to leaf index
 
         // idx = leaf chunk index
-        let chunk_start = idx * KEYS_PER_NODE;
+        let chunk_start = base;
         let chunk_end = (chunk_start + KEYS_PER_NODE).min(n);
-
-        match self.data[chunk_start..chunk_end].binary_search(value) {
-            Ok(i) => Ok(chunk_start + i),
-            Err(i) => Err(chunk_start + i),
+        
+        for i in chunk_start..chunk_end {
+            match self.data[i].cmp(value) {
+            std::cmp::Ordering::Equal => return Ok(i),
+            std::cmp::Ordering::Greater => return Err(i),
+            std::cmp::Ordering::Less => {}
+            }
         }
+        Err(chunk_end)
     }
 
     pub fn len(&self) -> usize { self.data.len() }
@@ -191,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_exact_node_boundaries() {
-        for &n in &[8u32, 9, 16, 17, 72, 73, 80, 81, 100, 128, 255, 256] {
+        for &n in &[8u32, 9, 16, 17, 64, 65, 72, 73, 80, 81, 100, 128, 255, 256] {
             let vals: Vec<u32> = (0..n).collect();
             let tree = DenseBTree::from_sorted(&vals);
             for i in 0..n {
