@@ -535,12 +535,12 @@ mod tests {
     use super::*;
 
     /// Minimal dense tensor for testing.
-    struct T {
+    struct Tensor {
         m: Vec<f32>,
         d: Vec<usize>,
     }
 
-    impl T {
+    impl Tensor {
         fn new(d: Vec<usize>) -> Self {
             let n: usize = d.iter().product();
             Self {
@@ -560,7 +560,7 @@ mod tests {
         }
     }
 
-    impl NDIndex<f32> for T {
+    impl NDIndex<f32> for Tensor {
         fn ndim(&self) -> usize {
             self.d.len()
         }
@@ -579,7 +579,7 @@ mod tests {
         }
     }
 
-    fn set_matrix(t: &mut T, vals: &[f32]) {
+    fn set_matrix(t: &mut Tensor, vals: &[f32]) {
         for (i, &v) in vals.iter().enumerate() {
             t.m[i] = v;
         }
@@ -587,12 +587,12 @@ mod tests {
 
     #[test]
     fn test_matmul() {
-        let mut a = T::new(vec![2, 3]);
-        let mut b = T::new(vec![3, 2]);
+        let mut a = Tensor::new(vec![2, 3]);
+        let mut b = Tensor::new(vec![3, 2]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         set_matrix(&mut b, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
 
-        let mut c = T::new(vec![2, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap();
 
         assert_eq!(c.get(&[0, 0]), 58.0);
@@ -603,10 +603,10 @@ mod tests {
 
     #[test]
     fn test_transpose() {
-        let mut a = T::new(vec![2, 3]);
+        let mut a = Tensor::new(vec![2, 3]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        let mut t = T::new(vec![3, 2]);
+        let mut t = Tensor::new(vec![3, 2]);
         einsum_unary("ab->ba", &a, &mut t).unwrap();
 
         assert_eq!(t.get(&[0, 0]), 1.0);
@@ -619,12 +619,12 @@ mod tests {
 
     #[test]
     fn test_outer_product() {
-        let mut a = T::new(vec![3]);
+        let mut a = Tensor::new(vec![3]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0]);
-        let mut b = T::new(vec![2]);
+        let mut b = Tensor::new(vec![2]);
         set_matrix(&mut b, &[4.0, 5.0]);
 
-        let mut c = T::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![3, 2]);
         einsum_binary("a,b->ab", &a, &b, &mut c).unwrap();
 
         assert_eq!(c.get(&[0, 0]), 4.0);
@@ -637,12 +637,12 @@ mod tests {
 
     #[test]
     fn test_vecmat() {
-        let mut v = T::new(vec![2]);
+        let mut v = Tensor::new(vec![2]);
         set_matrix(&mut v, &[1.0, 2.0]);
-        let mut m = T::new(vec![2, 2]);
+        let mut m = Tensor::new(vec![2, 2]);
         set_matrix(&mut m, &[3.0, 4.0, 5.0, 6.0]);
 
-        let mut r = T::new(vec![2]);
+        let mut r = Tensor::new(vec![2]);
         einsum_binary("a,ab->b", &v, &m, &mut r).unwrap();
 
         assert_eq!(r.get(&[0]), 13.0);
@@ -651,8 +651,8 @@ mod tests {
 
     #[test]
     fn test_dot() {
-        let mut a = T::new(vec![4]);
-        let mut b = T::new(vec![4]);
+        let mut a = Tensor::new(vec![4]);
+        let mut b = Tensor::new(vec![4]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0]);
         set_matrix(&mut b, &[5.0, 6.0, 7.0, 8.0]);
 
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_trace() {
-        let mut m = T::new(vec![3, 3]);
+        let mut m = Tensor::new(vec![3, 3]);
         set_matrix(
             &mut m,
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_frobenius2() {
-        let mut a = T::new(vec![2, 2]);
+        let mut a = Tensor::new(vec![2, 2]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0]);
 
         let result: f32 = einsum_binary_scalar("ab,ab->", &a, &a).unwrap();
@@ -684,8 +684,8 @@ mod tests {
     #[test]
     fn test_attention() {
         let (b, h, q_len, k_len, dim) = (2, 2, 3, 2, 4);
-        let mut q = T::new(vec![b, h, q_len, dim]);
-        let mut k = T::new(vec![b, h, k_len, dim]);
+        let mut q = Tensor::new(vec![b, h, q_len, dim]);
+        let mut k = Tensor::new(vec![b, h, k_len, dim]);
 
         for bi in 0..b {
             for hi in 0..h {
@@ -706,7 +706,7 @@ mod tests {
             }
         }
 
-        let mut out = T::new(vec![b, h, q_len, k_len]);
+        let mut out = Tensor::new(vec![b, h, q_len, k_len]);
         einsum_binary("bhqd,bhkd->bhqk", &q, &k, &mut out).unwrap();
 
         for bi in 0..b {
@@ -730,9 +730,9 @@ mod tests {
 
     #[test]
     fn test_err_missing_arrow() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         assert_eq!(
             einsum_binary("ab,bc", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::MissingArrow
@@ -741,9 +741,9 @@ mod tests {
 
     #[test]
     fn test_err_invalid_index() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         assert_eq!(
             einsum_binary("aB,bc->ac", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::InvalidIndex { ch: 'B' }
@@ -757,9 +757,9 @@ mod tests {
 
     #[test]
     fn test_err_wrong_input_count() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         // Binary function but spec has 1 input
         assert_eq!(
             einsum_binary("ab->ab", &a, &b, &mut c).unwrap_err(),
@@ -774,9 +774,9 @@ mod tests {
 
     #[test]
     fn test_err_empty_input() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         assert_eq!(
             einsum_binary(",bc->bc", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::EmptyInput { input: 0 }
@@ -785,9 +785,9 @@ mod tests {
 
     #[test]
     fn test_err_unbound_output_index() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         assert_eq!(
             einsum_binary("ab,bc->az", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::UnboundOutputIndex { index: 'z' }
@@ -797,9 +797,9 @@ mod tests {
     #[test]
     fn test_err_input_ndim_mismatch() {
         // a is 2D but spec says 3 indices
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         assert_eq!(
             einsum_binary("abc,bd->ad", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::InputNdimMismatch { input: 0, array_ndim: 2, spec_ndim: 3 }
@@ -809,9 +809,9 @@ mod tests {
     #[test]
     fn test_err_dimension_mismatch() {
         // a is 2×3, b is 3×2, spec says first dims must match (a=2 vs a=3)
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
-        let mut c = T::new(vec![2, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
+        let mut c = Tensor::new(vec![2, 2]);
         assert_eq!(
             einsum_binary("ab,ac->bc", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::DimensionMismatch { index: 'a', expected: 2, got: 3 }
@@ -820,10 +820,10 @@ mod tests {
 
     #[test]
     fn test_err_output_ndim_mismatch() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
         // Output is 1D but spec says 2D
-        let mut c = T::new(vec![2]);
+        let mut c = Tensor::new(vec![2]);
         assert_eq!(
             einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::OutputNdimMismatch { array_ndim: 1, spec_ndim: 2 }
@@ -832,10 +832,10 @@ mod tests {
 
     #[test]
     fn test_err_output_dim_mismatch() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![3, 2]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![3, 2]);
         // Output should be 2×2 but we give 2×3
-        let mut c = T::new(vec![2, 3]);
+        let mut c = Tensor::new(vec![2, 3]);
         assert_eq!(
             einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap_err(),
             InvalidSpec::OutputDimMismatch { axis: 1, expected: 2, got: 3 }
@@ -844,24 +844,24 @@ mod tests {
 
     #[test]
     fn test_err_non_empty_scalar_output() {
-        let a = T::new(vec![2, 3]);
-        let b = T::new(vec![2, 3]);
+        let a = Tensor::new(vec![2, 3]);
+        let b = Tensor::new(vec![2, 3]);
         assert_eq!(
-            einsum_binary_scalar::<f32, T>("ab,ab->a", &a, &b).unwrap_err(),
+            einsum_binary_scalar::<f32, Tensor>("ab,ab->a", &a, &b).unwrap_err(),
             InvalidSpec::NonEmptyScalarOutput
         );
         assert_eq!(
-            einsum_unary_scalar::<f32, T>("ab->a", &a).unwrap_err(),
+            einsum_unary_scalar::<f32, Tensor>("ab->a", &a).unwrap_err(),
             InvalidSpec::NonEmptyScalarOutput
         );
     }
 
     #[test]
     fn test_unary_row_sum() {
-        let mut a = T::new(vec![2, 3]);
+        let mut a = Tensor::new(vec![2, 3]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        let mut out = T::new(vec![2]);
+        let mut out = Tensor::new(vec![2]);
         einsum_unary("ab->a", &a, &mut out).unwrap();
 
         assert_eq!(out.get(&[0]), 6.0);

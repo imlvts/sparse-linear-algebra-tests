@@ -1,12 +1,12 @@
 use einsum_pm::einsum_fn;
 
 /// Minimal dense tensor for testing — mirrors the DenseTensorFRef API.
-struct T {
+struct Tensor {
     m: Vec<f32>,
     d: Vec<usize>,
 }
 
-impl T {
+impl Tensor {
     fn new(d: Vec<usize>) -> Self {
         let n: usize = d.iter().product();
         Self { m: vec![0.0; n], d }
@@ -33,36 +33,36 @@ impl T {
 }
 
 // matmul: ab,bc->ac
-einsum_fn!(matmul(a: T/ab, b: T/bc) -> T/ac);
+einsum_fn!(matmul(a: Tensor/ab, b: Tensor/bc) -> Tensor/ac);
 
 // batched matmul: abc,acd->abd
-einsum_fn!(batched_matmul(a: T/abc, b: T/acd) -> T/abd);
+einsum_fn!(batched_matmul(a: Tensor/abc, b: Tensor/acd) -> Tensor/abd);
 
 // attention: bhqd,bhkd->bhqk
-einsum_fn!(attention(q: T/bhqd, k: T/bhkd) -> T/bhqk);
+einsum_fn!(attention(q: Tensor/bhqd, k: Tensor/bhkd) -> Tensor/bhqk);
 
 // transpose: ab->ba
-einsum_fn!(transpose(a: T/ab) -> T/ba);
+einsum_fn!(transpose(a: Tensor/ab) -> Tensor/ba);
 
 // outer product: a,b->ab (no contraction)
-einsum_fn!(outer(a: T/a, b: T/b) -> T/ab);
+einsum_fn!(outer(a: Tensor/a, b: Tensor/b) -> Tensor/ab);
 
 // vector-matrix: a,ab->b
-einsum_fn!(vecmat(v: T/a, m: T/ab) -> T/b);
+einsum_fn!(vecmat(v: Tensor/a, m: Tensor/ab) -> Tensor/b);
 
 // dot product: a,a-> scalar
-einsum_fn!(dot(a: T/i, b: T/i) -> f32);
+einsum_fn!(dot(a: Tensor/i, b: Tensor/i) -> f32);
 
 // trace: aa-> scalar
-einsum_fn!(trace(m: T/aa) -> f32);
+einsum_fn!(trace(m: Tensor/aa) -> f32);
 
 // frobenius norm squared: ab,ab-> scalar
-einsum_fn!(frobenius2(a: T/ab, b: T/ab) -> f32);
+einsum_fn!(frobenius2(a: Tensor/ab, b: Tensor/ab) -> f32);
 
 #[test]
 fn test_matmul() {
-    let mut a = T::new(vec![2, 3]);
-    let mut b = T::new(vec![3, 2]);
+    let mut a = Tensor::new(vec![2, 3]);
+    let mut b = Tensor::new(vec![3, 2]);
 
     // a = [[1,2,3],[4,5,6]]
     a.set(&[0, 0], 1.0); a.set(&[0, 1], 2.0); a.set(&[0, 2], 3.0);
@@ -83,7 +83,7 @@ fn test_matmul() {
 
 #[test]
 fn test_transpose() {
-    let mut a = T::new(vec![2, 3]);
+    let mut a = Tensor::new(vec![2, 3]);
     a.set(&[0, 0], 1.0); a.set(&[0, 1], 2.0); a.set(&[0, 2], 3.0);
     a.set(&[1, 0], 4.0); a.set(&[1, 1], 5.0); a.set(&[1, 2], 6.0);
 
@@ -99,10 +99,10 @@ fn test_transpose() {
 
 #[test]
 fn test_outer_product() {
-    let mut a = T::new(vec![3]);
+    let mut a = Tensor::new(vec![3]);
     a.set(&[0], 1.0); a.set(&[1], 2.0); a.set(&[2], 3.0);
 
-    let mut b = T::new(vec![2]);
+    let mut b = Tensor::new(vec![2]);
     b.set(&[0], 4.0); b.set(&[1], 5.0);
 
     let c = outer(&a, &b);
@@ -117,10 +117,10 @@ fn test_outer_product() {
 
 #[test]
 fn test_vecmat() {
-    let mut v = T::new(vec![2]);
+    let mut v = Tensor::new(vec![2]);
     v.set(&[0], 1.0); v.set(&[1], 2.0);
 
-    let mut m = T::new(vec![2, 2]);
+    let mut m = Tensor::new(vec![2, 2]);
     m.set(&[0, 0], 3.0); m.set(&[0, 1], 4.0);
     m.set(&[1, 0], 5.0); m.set(&[1, 1], 6.0);
 
@@ -132,8 +132,8 @@ fn test_vecmat() {
 
 #[test]
 fn test_attention() {
-    let mut q = T::new(vec![1, 1, 2, 3]);
-    let mut k = T::new(vec![1, 1, 2, 3]);
+    let mut q = Tensor::new(vec![1, 1, 2, 3]);
+    let mut k = Tensor::new(vec![1, 1, 2, 3]);
 
     q.set(&[0, 0, 0, 0], 1.0);
     q.set(&[0, 0, 1, 1], 1.0);
@@ -153,8 +153,8 @@ fn test_attention() {
 fn test_batched_attention() {
     // batch=2, heads=2, q_len=3, k_len=2, dim=4
     let (b, h, q_len, k_len, dim) = (2, 2, 3, 2, 4);
-    let mut q = T::new(vec![b, h, q_len, dim]);
-    let mut k = T::new(vec![b, h, k_len, dim]);
+    let mut q = Tensor::new(vec![b, h, q_len, dim]);
+    let mut k = Tensor::new(vec![b, h, k_len, dim]);
 
     // Fill with deterministic values: q[b,h,q,d] = (b+1)*(h+1)*(q+1) + d
     //                                  k[b,h,k,d] = (b+1)*(h+1)*(k+1) * (d+1)
@@ -200,8 +200,8 @@ fn test_batched_attention() {
 
 #[test]
 fn test_dot() {
-    let mut a = T::new(vec![4]);
-    let mut b = T::new(vec![4]);
+    let mut a = Tensor::new(vec![4]);
+    let mut b = Tensor::new(vec![4]);
     a.set(&[0], 1.0); a.set(&[1], 2.0); a.set(&[2], 3.0); a.set(&[3], 4.0);
     b.set(&[0], 5.0); b.set(&[1], 6.0); b.set(&[2], 7.0); b.set(&[3], 8.0);
     // 1*5 + 2*6 + 3*7 + 4*8 = 5+12+21+32 = 70
@@ -210,7 +210,7 @@ fn test_dot() {
 
 #[test]
 fn test_trace() {
-    let mut m = T::new(vec![3, 3]);
+    let mut m = Tensor::new(vec![3, 3]);
     m.set(&[0, 0], 1.0); m.set(&[0, 1], 2.0); m.set(&[0, 2], 3.0);
     m.set(&[1, 0], 4.0); m.set(&[1, 1], 5.0); m.set(&[1, 2], 6.0);
     m.set(&[2, 0], 7.0); m.set(&[2, 1], 8.0); m.set(&[2, 2], 9.0);
@@ -221,7 +221,7 @@ fn test_trace() {
 #[test]
 fn test_frobenius2() {
     // frobenius2(A, A) = sum of squares of all elements
-    let mut a = T::new(vec![2, 2]);
+    let mut a = Tensor::new(vec![2, 2]);
     a.set(&[0, 0], 1.0); a.set(&[0, 1], 2.0);
     a.set(&[1, 0], 3.0); a.set(&[1, 1], 4.0);
     // 1+4+9+16 = 30
