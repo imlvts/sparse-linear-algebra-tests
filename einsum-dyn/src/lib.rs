@@ -713,17 +713,131 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_spec() {
+    fn test_err_missing_arrow() {
         let a = T::new(vec![2, 3]);
         let b = T::new(vec![3, 2]);
         let mut c = T::new(vec![2, 2]);
+        assert_eq!(
+            einsum_binary("ab,bc", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::MissingArrow
+        );
+    }
 
-        assert!(einsum_binary("ab,bc", &a, &b, &mut c).is_err());
-        assert!(einsum_binary("ab->ab", &a, &b, &mut c).is_err());
-        assert!(einsum_binary("ab,bc->az", &a, &b, &mut c).is_err());
+    #[test]
+    fn test_err_invalid_index() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        let mut c = T::new(vec![2, 2]);
+        assert_eq!(
+            einsum_binary("aB,bc->ac", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::InvalidIndex { ch: 'B' }
+        );
+        // Invalid char in output
+        assert_eq!(
+            einsum_binary("ab,bc->a1", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::InvalidIndex { ch: '1' }
+        );
+    }
 
-        let mut d = T::new(vec![2, 2]);
-        assert!(einsum_binary("ab,ac->bc", &a, &b, &mut d).is_err());
+    #[test]
+    fn test_err_wrong_input_count() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        let mut c = T::new(vec![2, 2]);
+        // Binary function but spec has 1 input
+        assert_eq!(
+            einsum_binary("ab->ab", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::WrongInputCount { expected: 2, got: 1 }
+        );
+        // Unary function but spec has 2 inputs
+        assert_eq!(
+            einsum_unary("ab,bc->ac", &a, &mut c).unwrap_err(),
+            InvalidSpec::WrongInputCount { expected: 1, got: 2 }
+        );
+    }
+
+    #[test]
+    fn test_err_empty_input() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        let mut c = T::new(vec![2, 2]);
+        assert_eq!(
+            einsum_binary(",bc->bc", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::EmptyInput { input: 0 }
+        );
+    }
+
+    #[test]
+    fn test_err_unbound_output_index() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        let mut c = T::new(vec![2, 2]);
+        assert_eq!(
+            einsum_binary("ab,bc->az", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::UnboundOutputIndex { index: 'z' }
+        );
+    }
+
+    #[test]
+    fn test_err_input_ndim_mismatch() {
+        // a is 2D but spec says 3 indices
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        let mut c = T::new(vec![2, 2]);
+        assert_eq!(
+            einsum_binary("abc,bd->ad", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::InputNdimMismatch { input: 0, array_ndim: 2, spec_ndim: 3 }
+        );
+    }
+
+    #[test]
+    fn test_err_dimension_mismatch() {
+        // a is 2×3, b is 3×2, spec says first dims must match (a=2 vs a=3)
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        let mut c = T::new(vec![2, 2]);
+        assert_eq!(
+            einsum_binary("ab,ac->bc", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::DimensionMismatch { index: 'a', expected: 2, got: 3 }
+        );
+    }
+
+    #[test]
+    fn test_err_output_ndim_mismatch() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        // Output is 1D but spec says 2D
+        let mut c = T::new(vec![2]);
+        assert_eq!(
+            einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::OutputNdimMismatch { array_ndim: 1, spec_ndim: 2 }
+        );
+    }
+
+    #[test]
+    fn test_err_output_dim_mismatch() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![3, 2]);
+        // Output should be 2×2 but we give 2×3
+        let mut c = T::new(vec![2, 3]);
+        assert_eq!(
+            einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap_err(),
+            InvalidSpec::OutputDimMismatch { axis: 1, expected: 2, got: 3 }
+        );
+    }
+
+    #[test]
+    fn test_err_non_empty_scalar_output() {
+        let a = T::new(vec![2, 3]);
+        let b = T::new(vec![2, 3]);
+        assert_eq!(
+            einsum_binary_scalar::<f32, T>("ab,ab->a", &a, &b).unwrap_err(),
+            InvalidSpec::NonEmptyScalarOutput
+        );
+        assert_eq!(
+            einsum_unary_scalar::<f32, T>("ab->a", &a).unwrap_err(),
+            InvalidSpec::NonEmptyScalarOutput
+        );
     }
 
     #[test]
