@@ -2,3 +2,10 @@
 name = "einsum-dyn"
 version = "0.1.0"
 edition = "2024"
+
+[dev-dependencies]
+einsum-pm = { path = "../einsum-pm" }
+
+[[bench]]
+name = "einsum_bench"
+harness = false

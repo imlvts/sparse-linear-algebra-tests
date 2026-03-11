@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{AddAssign, Mul};
 
@@ -21,6 +20,12 @@ impl fmt::Display for InvalidSpec {
 }
 
 impl std::error::Error for InvalidSpec {}
+
+/// Slot index for a char: `ch as u8 - b'a'`, so 'a'=0, 'b'=1, ..., 'z'=25.
+#[inline(always)]
+fn slot(ch: char) -> u8 {
+    ch as u8 - b'a'
+}
 
 /// Parsed einsum specification.
 struct Spec {
@@ -69,17 +74,15 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
         }
     }
 
-    // Build index locations map
-    let mut index_locs: BTreeMap<char, Vec<(usize, usize)>> = BTreeMap::new();
-    for (pi, inp) in inputs.iter().enumerate() {
-        for (pos, &ch) in inp.iter().enumerate() {
-            index_locs.entry(ch).or_default().push((pi, pos));
+    // Validate: every output index must appear in at least one input
+    let mut seen = [false; 26];
+    for inp in &inputs {
+        for &ch in inp {
+            seen[slot(ch) as usize] = true;
         }
     }
-
-    // Validate: every output index must appear in at least one input
     for &ch in &output {
-        if !index_locs.contains_key(&ch) {
+        if !seen[slot(ch) as usize] {
             return Err(InvalidSpec(format!(
                 "output index '{}' does not appear in any input",
                 ch
@@ -90,12 +93,12 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
     Ok(Spec { inputs, output })
 }
 
-/// Validates that array dimensions match the spec.
+/// Validates that array dimensions match the spec. Returns dims as a `[usize; 26]`
+/// array (indexed by slot). Unused slots are 0.
 fn validate_dims<T, Arr: NDIndex<T>>(
     spec: &Spec,
     arrays: &[&Arr],
-) -> Result<BTreeMap<char, usize>, InvalidSpec> {
-    // Check ndim of each input
+) -> Result<[usize; 26], InvalidSpec> {
     for (i, (inp, arr)) in spec.inputs.iter().zip(arrays.iter()).enumerate() {
         if arr.ndim() != inp.len() {
             return Err(InvalidSpec(format!(
@@ -107,20 +110,22 @@ fn validate_dims<T, Arr: NDIndex<T>>(
         }
     }
 
-    // Build dimension map, checking consistency
-    let mut dims: BTreeMap<char, usize> = BTreeMap::new();
+    let mut dims = [0usize; 26];
+    let mut set = [false; 26];
     for (pi, inp) in spec.inputs.iter().enumerate() {
         for (pos, &ch) in inp.iter().enumerate() {
+            let s = slot(ch) as usize;
             let d = arrays[pi].dim(pos);
-            if let Some(&existing) = dims.get(&ch) {
-                if existing != d {
+            if set[s] {
+                if dims[s] != d {
                     return Err(InvalidSpec(format!(
                         "dimension mismatch for index '{}': {} vs {}",
-                        ch, existing, d
+                        ch, dims[s], d
                     )));
                 }
             } else {
-                dims.insert(ch, d);
+                dims[s] = d;
+                set[s] = true;
             }
         }
     }
@@ -128,48 +133,123 @@ fn validate_dims<T, Arr: NDIndex<T>>(
     Ok(dims)
 }
 
-/// Collects all unique indices in order of first appearance across inputs.
-fn all_indices_ordered(spec: &Spec) -> Vec<char> {
-    let mut seen = Vec::new();
+/// Collects all unique indices in order of first appearance, as a SlotList.
+fn all_slots_ordered(spec: &Spec) -> SlotList {
+    let mut seen = [false; 26];
+    let mut slots = [0u8; 26];
+    let mut len = 0u8;
     for inp in &spec.inputs {
         for &ch in inp {
-            if !seen.contains(&ch) {
-                seen.push(ch);
+            let s = slot(ch);
+            if !seen[s as usize] {
+                seen[s as usize] = true;
+                slots[len as usize] = s;
+                len += 1;
             }
         }
     }
-    seen
+    SlotList { slots, len }
 }
 
-/// Executes the einsum loop nest, calling `emit` for each combination of index values.
-///
-/// `loop_indices` is the ordered list of index chars to iterate over.
-/// `dims` maps each index char to its size.
-/// `emit` receives the current index values map for each innermost iteration.
+/// Stack-only index buffer: fixed array + length, no heap.
+struct Idx {
+    data: [usize; 26],
+    len: u8,
+}
+
+impl Idx {
+    #[inline(always)]
+    fn as_slice(&self) -> &[usize] {
+        &self.data[..self.len as usize]
+    }
+}
+
+/// Precomputed gather pattern: slot indices stored on the stack.
+struct Pattern {
+    slots: [u8; 26],
+    len: u8,
+}
+
+impl Pattern {
+    fn from_chars(chars: &[char]) -> Self {
+        let mut slots = [0u8; 26];
+        for (i, &ch) in chars.iter().enumerate() {
+            slots[i] = slot(ch);
+        }
+        Pattern {
+            slots,
+            len: chars.len() as u8,
+        }
+    }
+
+    /// Gather index values from `vals` into `out` according to this pattern.
+    #[inline(always)]
+    fn gather(&self, vals: &[usize; 26], out: &mut Idx) {
+        out.len = self.len;
+        for i in 0..self.len as usize {
+            out.data[i] = vals[self.slots[i] as usize];
+        }
+    }
+}
+
+/// Precomputed loop-slot list stored on the stack.
+struct SlotList {
+    slots: [u8; 26],
+    len: u8,
+}
+
+impl SlotList {
+    fn from_pattern(p: &Pattern) -> Self {
+        SlotList {
+            slots: p.slots,
+            len: p.len,
+        }
+    }
+
+    fn from_chars(chars: &[char]) -> Self {
+        let p = Pattern::from_chars(chars);
+        Self::from_pattern(&p)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.slots[..self.len as usize]
+    }
+
+    fn contains(&self, s: u8) -> bool {
+        self.as_slice().contains(&s)
+    }
+
+    fn filtered_complement(all: &[u8], free: &SlotList) -> Self {
+        let mut slots = [0u8; 26];
+        let mut len = 0u8;
+        for &s in all {
+            if !free.contains(s) {
+                slots[len as usize] = s;
+                len += 1;
+            }
+        }
+        SlotList { slots, len }
+    }
+}
+
+/// Recursive loop nest over slots. `loop_slots[i]` is a slot index,
+/// `dims` and `vals` are flat [usize; 26] arrays.
 fn loop_nest(
-    loop_indices: &[char],
-    dims: &BTreeMap<char, usize>,
-    idx_vals: &mut BTreeMap<char, usize>,
-    emit: &mut impl FnMut(&BTreeMap<char, usize>),
+    loop_slots: &[u8],
+    dims: &[usize; 26],
+    vals: &mut [usize; 26],
+    emit: &mut impl FnMut(&[usize; 26]),
 ) {
-    if loop_indices.is_empty() {
-        emit(idx_vals);
+    if loop_slots.is_empty() {
+        emit(vals);
         return;
     }
-    let ch = loop_indices[0];
-    let rest = &loop_indices[1..];
-    let n = dims[&ch];
+    let s = loop_slots[0] as usize;
+    let rest = &loop_slots[1..];
+    let n = dims[s];
     for v in 0..n {
-        idx_vals.insert(ch, v);
-        loop_nest(rest, dims, idx_vals, emit);
-    }
-}
-
-/// Builds an index slice from index chars and current values.
-fn gather_indices(chars: &[char], vals: &BTreeMap<char, usize>, buf: &mut Vec<usize>) {
-    buf.clear();
-    for &ch in chars {
-        buf.push(vals[&ch]);
+        vals[s] = v;
+        loop_nest(rest, dims, vals, emit);
     }
 }
 
@@ -187,7 +267,6 @@ where
     let spec = parse_spec(spec, 2)?;
     let dims = validate_dims(&spec, &[a, b])?;
 
-    // Validate output dimensions
     if out.ndim() != spec.output.len() {
         return Err(InvalidSpec(format!(
             "output has {} dimensions but spec has {} output indices",
@@ -196,65 +275,54 @@ where
         )));
     }
     for (pos, &ch) in spec.output.iter().enumerate() {
-        if out.dim(pos) != dims[&ch] {
+        if out.dim(pos) != dims[slot(ch) as usize] {
             return Err(InvalidSpec(format!(
                 "output dimension {} is {} but expected {}",
                 pos,
                 out.dim(pos),
-                dims[&ch]
+                dims[slot(ch) as usize]
             )));
         }
     }
 
-    let free_set: Vec<char> = spec.output.clone();
-    let all = all_indices_ordered(&spec);
-    let contracted: Vec<char> = all
-        .iter()
-        .filter(|ch| !free_set.contains(ch))
-        .copied()
-        .collect();
+    let free_slots = SlotList::from_chars(&spec.output);
+    let all = all_slots_ordered(&spec);
+    let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
 
-    // Loop order: free indices first, then contracted
-    let mut loop_order = free_set.clone();
-    loop_order.extend(&contracted);
+    let pat_a = Pattern::from_chars(&spec.inputs[0]);
+    let pat_b = Pattern::from_chars(&spec.inputs[1]);
+    let pat_out = Pattern::from_chars(&spec.output);
 
-    let mut idx_vals = BTreeMap::new();
-    let mut buf_a = Vec::new();
-    let mut buf_b = Vec::new();
-    let mut buf_out = Vec::new();
+    let mut vals = [0usize; 26];
+    let mut buf_a = Idx { data: [0; 26], len: 0 };
+    let mut buf_b = Idx { data: [0; 26], len: 0 };
+    let mut buf_out = Idx { data: [0; 26], len: 0 };
 
-    let inp_a = &spec.inputs[0];
-    let inp_b = &spec.inputs[1];
-    let out_indices = &spec.output;
-
-    if contracted.is_empty() {
+    if contracted_slots.len == 0 {
         // No contraction — direct assignment
-        loop_nest(&loop_order, &dims, &mut idx_vals, &mut |vals| {
-            gather_indices(inp_a, vals, &mut buf_a);
-            gather_indices(inp_b, vals, &mut buf_b);
-            gather_indices(out_indices, vals, &mut buf_out);
-            let v = a.get(&buf_a) * b.get(&buf_b);
-            out.set(&buf_out, v);
+        loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |vals| {
+            pat_a.gather(vals, &mut buf_a);
+            pat_b.gather(vals, &mut buf_b);
+            pat_out.gather(vals, &mut buf_out);
+            out.set(buf_out.as_slice(), a.get(buf_a.as_slice()) * b.get(buf_b.as_slice()));
         });
     } else {
-        // With contraction — need to accumulate
-        // We iterate over free indices, and for each, sum over contracted
-        let mut idx_vals_outer = BTreeMap::new();
-        loop_nest(&free_set, &dims, &mut idx_vals_outer, &mut |free_vals| {
+        // With contraction — accumulate per output element
+        loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |free_vals| {
             let mut acc: T = Default::default();
-            let mut idx_vals_inner = free_vals.clone();
+            let mut inner_vals = *free_vals;
             loop_nest(
-                &contracted,
+                contracted_slots.as_slice(),
                 &dims,
-                &mut idx_vals_inner,
+                &mut inner_vals,
                 &mut |vals| {
-                    gather_indices(inp_a, vals, &mut buf_a);
-                    gather_indices(inp_b, vals, &mut buf_b);
-                    acc += a.get(&buf_a) * b.get(&buf_b);
+                    pat_a.gather(vals, &mut buf_a);
+                    pat_b.gather(vals, &mut buf_b);
+                    acc += a.get(buf_a.as_slice()) * b.get(buf_b.as_slice());
                 },
             );
-            gather_indices(out_indices, &idx_vals_inner, &mut buf_out);
-            out.set(&buf_out, acc);
+            pat_out.gather(free_vals, &mut buf_out);
+            out.set(buf_out.as_slice(), acc);
         });
     }
 
@@ -280,53 +348,47 @@ where
         )));
     }
     for (pos, &ch) in spec.output.iter().enumerate() {
-        if out.dim(pos) != dims[&ch] {
+        if out.dim(pos) != dims[slot(ch) as usize] {
             return Err(InvalidSpec(format!(
                 "output dimension {} is {} but expected {}",
                 pos,
                 out.dim(pos),
-                dims[&ch]
+                dims[slot(ch) as usize]
             )));
         }
     }
 
-    let free_set: Vec<char> = spec.output.clone();
-    let all = all_indices_ordered(&spec);
-    let contracted: Vec<char> = all
-        .iter()
-        .filter(|ch| !free_set.contains(ch))
-        .copied()
-        .collect();
+    let free_slots = SlotList::from_chars(&spec.output);
+    let all = all_slots_ordered(&spec);
+    let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
 
-    let inp_a = &spec.inputs[0];
-    let out_indices = &spec.output;
-    let mut buf_a = Vec::new();
-    let mut buf_out = Vec::new();
+    let pat_a = Pattern::from_chars(&spec.inputs[0]);
+    let pat_out = Pattern::from_chars(&spec.output);
+    let mut vals = [0usize; 26];
+    let mut buf_a = Idx { data: [0; 26], len: 0 };
+    let mut buf_out = Idx { data: [0; 26], len: 0 };
 
-    if contracted.is_empty() {
-        let loop_order = free_set.clone();
-        let mut idx_vals = BTreeMap::new();
-        loop_nest(&loop_order, &dims, &mut idx_vals, &mut |vals| {
-            gather_indices(inp_a, vals, &mut buf_a);
-            gather_indices(out_indices, vals, &mut buf_out);
-            out.set(&buf_out, a.get(&buf_a));
+    if contracted_slots.len == 0 {
+        loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |vals| {
+            pat_a.gather(vals, &mut buf_a);
+            pat_out.gather(vals, &mut buf_out);
+            out.set(buf_out.as_slice(), a.get(buf_a.as_slice()));
         });
     } else {
-        let mut idx_vals_outer = BTreeMap::new();
-        loop_nest(&free_set, &dims, &mut idx_vals_outer, &mut |free_vals| {
+        loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |free_vals| {
             let mut acc: T = Default::default();
-            let mut idx_vals_inner = free_vals.clone();
+            let mut inner_vals = *free_vals;
             loop_nest(
-                &contracted,
+                contracted_slots.as_slice(),
                 &dims,
-                &mut idx_vals_inner,
+                &mut inner_vals,
                 &mut |vals| {
-                    gather_indices(inp_a, vals, &mut buf_a);
-                    acc += a.get(&buf_a);
+                    pat_a.gather(vals, &mut buf_a);
+                    acc += a.get(buf_a.as_slice());
                 },
             );
-            gather_indices(out_indices, &idx_vals_inner, &mut buf_out);
-            out.set(&buf_out, acc);
+            pat_out.gather(free_vals, &mut buf_out);
+            out.set(buf_out.as_slice(), acc);
         });
     }
 
@@ -350,18 +412,18 @@ where
         ));
     }
 
-    let all = all_indices_ordered(&spec);
-    let inp_a = &spec.inputs[0];
-    let inp_b = &spec.inputs[1];
-    let mut buf_a = Vec::new();
-    let mut buf_b = Vec::new();
+    let all = all_slots_ordered(&spec);
+    let pat_a = Pattern::from_chars(&spec.inputs[0]);
+    let pat_b = Pattern::from_chars(&spec.inputs[1]);
+    let mut vals = [0usize; 26];
+    let mut buf_a = Idx { data: [0; 26], len: 0 };
+    let mut buf_b = Idx { data: [0; 26], len: 0 };
     let mut acc: T = Default::default();
 
-    let mut idx_vals = BTreeMap::new();
-    loop_nest(&all, &dims, &mut idx_vals, &mut |vals| {
-        gather_indices(inp_a, vals, &mut buf_a);
-        gather_indices(inp_b, vals, &mut buf_b);
-        acc += a.get(&buf_a) * b.get(&buf_b);
+    loop_nest(all.as_slice(), &dims, &mut vals, &mut |vals| {
+        pat_a.gather(vals, &mut buf_a);
+        pat_b.gather(vals, &mut buf_b);
+        acc += a.get(buf_a.as_slice()) * b.get(buf_b.as_slice());
     });
 
     Ok(acc)
@@ -384,15 +446,15 @@ where
         ));
     }
 
-    let all = all_indices_ordered(&spec);
-    let inp_a = &spec.inputs[0];
-    let mut buf_a = Vec::new();
+    let all = all_slots_ordered(&spec);
+    let pat_a = Pattern::from_chars(&spec.inputs[0]);
+    let mut vals = [0usize; 26];
+    let mut buf_a = Idx { data: [0; 26], len: 0 };
     let mut acc: T = Default::default();
 
-    let mut idx_vals = BTreeMap::new();
-    loop_nest(&all, &dims, &mut idx_vals, &mut |vals| {
-        gather_indices(inp_a, vals, &mut buf_a);
-        acc += a.get(&buf_a);
+    loop_nest(all.as_slice(), &dims, &mut vals, &mut |vals| {
+        pat_a.gather(vals, &mut buf_a);
+        acc += a.get(buf_a.as_slice());
     });
 
     Ok(acc)
@@ -577,7 +639,6 @@ mod tests {
         let mut out = T::new(vec![b, h, q_len, k_len]);
         einsum_binary("bhqd,bhkd->bhqk", &q, &k, &mut out).unwrap();
 
-        // Verify against naive computation
         for bi in 0..b {
             for hi in 0..h {
                 for qi in 0..q_len {
@@ -603,30 +664,23 @@ mod tests {
         let b = T::new(vec![3, 2]);
         let mut c = T::new(vec![2, 2]);
 
-        // Missing arrow
         assert!(einsum_binary("ab,bc", &a, &b, &mut c).is_err());
-
-        // Wrong number of inputs
         assert!(einsum_binary("ab->ab", &a, &b, &mut c).is_err());
-
-        // Output index not in any input
         assert!(einsum_binary("ab,bc->az", &a, &b, &mut c).is_err());
 
-        // Dimension mismatch (a is 2x3, b is 3x2, spec says both first dims match)
         let mut d = T::new(vec![2, 2]);
         assert!(einsum_binary("ab,ac->bc", &a, &b, &mut d).is_err());
     }
 
     #[test]
     fn test_unary_row_sum() {
-        // Sum over columns: ab->a means sum over b
         let mut a = T::new(vec![2, 3]);
         set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         let mut out = T::new(vec![2]);
         einsum_unary("ab->a", &a, &mut out).unwrap();
 
-        assert_eq!(out.get(&[0]), 6.0); // 1+2+3
-        assert_eq!(out.get(&[1]), 15.0); // 4+5+6
+        assert_eq!(out.get(&[0]), 6.0);
+        assert_eq!(out.get(&[1]), 15.0);
     }
 }
