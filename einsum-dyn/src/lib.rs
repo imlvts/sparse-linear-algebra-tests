@@ -9,6 +9,22 @@ pub trait NDIndex<T> {
     fn set(&mut self, indices: &[usize], val: T);
 }
 
+#[cfg(feature = "ndarray")]
+impl<T: Copy> NDIndex<T> for ndarray::ArrayD<T> {
+    fn ndim(&self) -> usize {
+        self.ndim()
+    }
+    fn dim(&self, axis: usize) -> usize {
+        self.shape()[axis]
+    }
+    fn get(&self, ix: &[usize]) -> T {
+        self[ndarray::IxDyn(ix)]
+    }
+    fn set(&mut self, ix: &[usize], val: T) {
+        self[ndarray::IxDyn(ix)] = val;
+    }
+}
+
 /// Error returned when an einsum spec string is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidSpec {
@@ -850,5 +866,105 @@ mod tests {
 
         assert_eq!(out.get(&[0]), 6.0);
         assert_eq!(out.get(&[1]), 15.0);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "ndarray")]
+mod ndarray_tests {
+    use super::*;
+    use ndarray::{ArrayD, IxDyn};
+
+    fn arr1(data: &[f64]) -> ArrayD<f64> {
+        ArrayD::from_shape_vec(IxDyn(&[data.len()]), data.to_vec()).unwrap()
+    }
+
+    fn arr2(rows: usize, cols: usize, data: &[f64]) -> ArrayD<f64> {
+        ArrayD::from_shape_vec(IxDyn(&[rows, cols]), data.to_vec()).unwrap()
+    }
+
+    fn zeros(shape: &[usize]) -> ArrayD<f64> {
+        ArrayD::zeros(IxDyn(shape))
+    }
+
+    #[test]
+    fn test_ndindex_trait() {
+        let a = arr2(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(NDIndex::ndim(&a), 2);
+        assert_eq!(NDIndex::dim(&a, 0), 2);
+        assert_eq!(NDIndex::dim(&a, 1), 2);
+        assert_eq!(NDIndex::get(&a, &[0, 1]), 2.0);
+        assert_eq!(NDIndex::get(&a, &[1, 0]), 3.0);
+
+        let mut b = a.clone();
+        NDIndex::set(&mut b, &[0, 0], 99.0);
+        assert_eq!(NDIndex::get(&b, &[0, 0]), 99.0);
+    }
+
+    #[test]
+    fn test_matmul() {
+        let a = arr2(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = arr2(3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let mut c = zeros(&[2, 2]);
+
+        einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap();
+
+        assert_eq!(c[IxDyn(&[0, 0])], 58.0);
+        assert_eq!(c[IxDyn(&[0, 1])], 64.0);
+        assert_eq!(c[IxDyn(&[1, 0])], 139.0);
+        assert_eq!(c[IxDyn(&[1, 1])], 154.0);
+    }
+
+    #[test]
+    fn test_transpose() {
+        let a = arr2(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut t = zeros(&[3, 2]);
+
+        einsum_unary("ab->ba", &a, &mut t).unwrap();
+
+        assert_eq!(t[IxDyn(&[0, 0])], 1.0);
+        assert_eq!(t[IxDyn(&[0, 1])], 4.0);
+        assert_eq!(t[IxDyn(&[1, 0])], 2.0);
+        assert_eq!(t[IxDyn(&[2, 1])], 6.0);
+    }
+
+    #[test]
+    fn test_dot() {
+        let a = arr1(&[1.0, 2.0, 3.0, 4.0]);
+        let b = arr1(&[5.0, 6.0, 7.0, 8.0]);
+
+        let result: f64 = einsum_binary_scalar("i,i->", &a, &b).unwrap();
+        assert_eq!(result, 70.0);
+    }
+
+    #[test]
+    fn test_trace() {
+        let m = arr2(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let result: f64 = einsum_unary_scalar("aa->", &m).unwrap();
+        assert_eq!(result, 15.0);
+    }
+
+    #[test]
+    fn test_outer_product() {
+        let a = arr1(&[1.0, 2.0, 3.0]);
+        let b = arr1(&[4.0, 5.0]);
+        let mut c = zeros(&[3, 2]);
+
+        einsum_binary("a,b->ab", &a, &b, &mut c).unwrap();
+
+        assert_eq!(c[IxDyn(&[0, 0])], 4.0);
+        assert_eq!(c[IxDyn(&[1, 1])], 10.0);
+        assert_eq!(c[IxDyn(&[2, 0])], 12.0);
+    }
+
+    #[test]
+    fn test_row_sum() {
+        let a = arr2(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut out = zeros(&[2]);
+
+        einsum_unary("ab->a", &a, &mut out).unwrap();
+
+        assert_eq!(out[IxDyn(&[0])], 6.0);
+        assert_eq!(out[IxDyn(&[1])], 15.0);
     }
 }
