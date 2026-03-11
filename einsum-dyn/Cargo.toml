@@ -1,0 +1,18 @@
+[package]
+name = "einsum-dyn"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+ndarray = ["dep:ndarray"]
+
+[dependencies]
+ndarray = { version = "0.16", optional = true }
+
+[dev-dependencies]
+einsum-pm = { path = "../einsum-pm" }
+ndarray = "0.16"
+
+[[bench]]
+name = "einsum_bench"
+harness = false
