@@ -234,6 +234,7 @@ impl SlotList {
 
 /// Recursive loop nest over slots. `loop_slots[i]` is a slot index,
 /// `dims` and `vals` are flat [usize; 26] arrays.
+#[inline(always)]
 fn loop_nest(
     loop_slots: &[u8],
     dims: &[usize; 26],
@@ -250,6 +251,45 @@ fn loop_nest(
     for v in 0..n {
         vals[s] = v;
         loop_nest(rest, dims, vals, emit);
+    }
+}
+
+// Iterative variant using an explicit counter stack.
+// Benchmarked ~same as recursive.
+#[cfg(any())]
+#[inline(always)]
+fn loop_nest_iterative(
+    loop_slots: &[u8],
+    dims: &[usize; 26],
+    vals: &mut [usize; 26],
+    emit: &mut impl FnMut(&[usize; 26]),
+) {
+    let depth = loop_slots.len();
+    if depth == 0 {
+        emit(vals);
+        return;
+    }
+    let mut counters = [0usize; 26];
+    for i in 0..depth {
+        vals[loop_slots[i] as usize] = 0;
+    }
+    loop {
+        emit(vals);
+        let mut level = depth - 1;
+        loop {
+            let s = loop_slots[level] as usize;
+            counters[level] += 1;
+            if counters[level] < dims[s] {
+                vals[s] = counters[level];
+                break;
+            }
+            counters[level] = 0;
+            vals[s] = 0;
+            if level == 0 {
+                return;
+            }
+            level -= 1;
+        }
     }
 }
 
