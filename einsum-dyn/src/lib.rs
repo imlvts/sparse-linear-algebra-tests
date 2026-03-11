@@ -10,12 +10,53 @@ pub trait NDIndex<T> {
 }
 
 /// Error returned when an einsum spec string is invalid.
-#[derive(Debug, Clone)]
-pub struct InvalidSpec(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidSpec {
+    MissingArrow,
+    InvalidIndex { ch: char },
+    WrongInputCount { expected: usize, got: usize },
+    EmptyInput { input: usize },
+    UnboundOutputIndex { index: char },
+    InputNdimMismatch { input: usize, array_ndim: usize, spec_ndim: usize },
+    DimensionMismatch { index: char, expected: usize, got: usize },
+    OutputNdimMismatch { array_ndim: usize, spec_ndim: usize },
+    OutputDimMismatch { axis: usize, expected: usize, got: usize },
+    NonEmptyScalarOutput,
+}
+
+/// Convert a slot index back to its letter for error messages.
+fn slot_to_char(s: u8) -> char {
+    (s + b'a') as char
+}
 
 impl fmt::Display for InvalidSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid einsum spec: {}", self.0)
+        match self {
+            Self::MissingArrow => write!(f, "missing '->'"),
+            Self::InvalidIndex { ch } => write!(f, "index '{ch}' is not a lowercase letter"),
+            Self::WrongInputCount { expected, got } => {
+                write!(f, "expected {expected} input(s), got {got}")
+            }
+            Self::EmptyInput { input } => write!(f, "input {input} has no indices"),
+            Self::UnboundOutputIndex { index } => {
+                write!(f, "output index '{index}' does not appear in any input")
+            }
+            Self::InputNdimMismatch { input, array_ndim, spec_ndim } => {
+                write!(f, "input {input} has {array_ndim} dimensions but spec has {spec_ndim} indices")
+            }
+            Self::DimensionMismatch { index, expected, got } => {
+                write!(f, "dimension mismatch for index '{index}': {expected} vs {got}")
+            }
+            Self::OutputNdimMismatch { array_ndim, spec_ndim } => {
+                write!(f, "output has {array_ndim} dimensions but spec has {spec_ndim} output indices")
+            }
+            Self::OutputDimMismatch { axis, expected, got } => {
+                write!(f, "output dimension {axis} is {got} but expected {expected}")
+            }
+            Self::NonEmptyScalarOutput => {
+                write!(f, "scalar output requires empty output indices (use '...->')")
+            }
+        }
     }
 }
 
@@ -33,17 +74,14 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
 
     let (lhs, rhs) = spec
         .split_once("->")
-        .ok_or_else(|| InvalidSpec("missing '->'".into()))?;
+        .ok_or(InvalidSpec::MissingArrow)?;
 
     let mut inputs: Vec<Vec<u8>> = Vec::new();
     for part in lhs.split(',') {
         let mut slots = Vec::new();
         for ch in part.bytes() {
             if !ch.is_ascii_lowercase() {
-                return Err(InvalidSpec(format!(
-                    "index '{}' is not a lowercase letter",
-                    ch as char
-                )));
+                return Err(InvalidSpec::InvalidIndex { ch: ch as char });
             }
             slots.push(ch - b'a');
         }
@@ -51,26 +89,22 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
     }
 
     if inputs.len() != expected_inputs {
-        return Err(InvalidSpec(format!(
-            "expected {} input(s), got {}",
-            expected_inputs,
-            inputs.len()
-        )));
+        return Err(InvalidSpec::WrongInputCount {
+            expected: expected_inputs,
+            got: inputs.len(),
+        });
     }
 
     for (i, inp) in inputs.iter().enumerate() {
         if inp.is_empty() {
-            return Err(InvalidSpec(format!("input {} has no indices", i)));
+            return Err(InvalidSpec::EmptyInput { input: i });
         }
     }
 
     let mut output: Vec<u8> = Vec::new();
     for ch in rhs.bytes() {
         if !ch.is_ascii_lowercase() {
-            return Err(InvalidSpec(format!(
-                "output index '{}' is not a lowercase letter",
-                ch as char
-            )));
+            return Err(InvalidSpec::InvalidIndex { ch: ch as char });
         }
         output.push(ch - b'a');
     }
@@ -84,10 +118,7 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
     }
     for &s in &output {
         if !seen[s as usize] {
-            return Err(InvalidSpec(format!(
-                "output index '{}' does not appear in any input",
-                (s + b'a') as char
-            )));
+            return Err(InvalidSpec::UnboundOutputIndex { index: slot_to_char(s) });
         }
     }
 
@@ -102,12 +133,11 @@ fn validate_dims<T, Arr: NDIndex<T>>(
 ) -> Result<[usize; 26], InvalidSpec> {
     for (i, (inp, arr)) in spec.inputs.iter().zip(arrays.iter()).enumerate() {
         if arr.ndim() != inp.len() {
-            return Err(InvalidSpec(format!(
-                "input {} has {} dimensions but spec has {} indices",
-                i,
-                arr.ndim(),
-                inp.len()
-            )));
+            return Err(InvalidSpec::InputNdimMismatch {
+                input: i,
+                array_ndim: arr.ndim(),
+                spec_ndim: inp.len(),
+            });
         }
     }
 
@@ -119,12 +149,11 @@ fn validate_dims<T, Arr: NDIndex<T>>(
             let d = arrays[pi].dim(pos);
             if set[si] {
                 if dims[si] != d {
-                    return Err(InvalidSpec(format!(
-                        "dimension mismatch for index '{}': {} vs {}",
-                        (s + b'a') as char,
-                        dims[si],
-                        d
-                    )));
+                    return Err(InvalidSpec::DimensionMismatch {
+                        index: slot_to_char(s),
+                        expected: dims[si],
+                        got: d,
+                    });
                 }
             } else {
                 dims[si] = d;
@@ -299,20 +328,18 @@ fn validate_output<T, Arr: NDIndex<T>>(
     out: &Arr,
 ) -> Result<(), InvalidSpec> {
     if out.ndim() != spec.output.len() {
-        return Err(InvalidSpec(format!(
-            "output has {} dimensions but spec has {} output indices",
-            out.ndim(),
-            spec.output.len()
-        )));
+        return Err(InvalidSpec::OutputNdimMismatch {
+            array_ndim: out.ndim(),
+            spec_ndim: spec.output.len(),
+        });
     }
     for (pos, &s) in spec.output.iter().enumerate() {
         if out.dim(pos) != dims[s as usize] {
-            return Err(InvalidSpec(format!(
-                "output dimension {} is {} but expected {}",
-                pos,
-                out.dim(pos),
-                dims[s as usize]
-            )));
+            return Err(InvalidSpec::OutputDimMismatch {
+                axis: pos,
+                expected: dims[s as usize],
+                got: out.dim(pos),
+            });
         }
     }
     Ok(())
@@ -438,9 +465,7 @@ where
     let dims = validate_dims(&spec, &[a, b])?;
 
     if !spec.output.is_empty() {
-        return Err(InvalidSpec(
-            "scalar output requires empty output indices (use 'ab,ab->')".into(),
-        ));
+        return Err(InvalidSpec::NonEmptyScalarOutput);
     }
 
     let all = all_slots_ordered(&spec);
@@ -472,9 +497,7 @@ where
     let dims = validate_dims(&spec, &[a])?;
 
     if !spec.output.is_empty() {
-        return Err(InvalidSpec(
-            "scalar output requires empty output indices (use 'aa->')".into(),
-        ));
+        return Err(InvalidSpec::NonEmptyScalarOutput);
     }
 
     let all = all_slots_ordered(&spec);
