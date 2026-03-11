@@ -21,16 +21,11 @@ impl fmt::Display for InvalidSpec {
 
 impl std::error::Error for InvalidSpec {}
 
-/// Slot index for a char: `ch as u8 - b'a'`, so 'a'=0, 'b'=1, ..., 'z'=25.
-#[inline(always)]
-fn slot(ch: char) -> u8 {
-    ch as u8 - b'a'
-}
-
-/// Parsed einsum specification.
+/// Parsed einsum specification. All index chars are stored as slot indices
+/// (`b'a'` → 0, `b'b'` → 1, ..., `b'z'` → 25).
 struct Spec {
-    inputs: Vec<Vec<char>>,
-    output: Vec<char>,
+    inputs: Vec<Vec<u8>>,
+    output: Vec<u8>,
 }
 
 fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
@@ -40,7 +35,20 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
         .split_once("->")
         .ok_or_else(|| InvalidSpec("missing '->'".into()))?;
 
-    let inputs: Vec<Vec<char>> = lhs.split(',').map(|s| s.chars().collect()).collect();
+    let mut inputs: Vec<Vec<u8>> = Vec::new();
+    for part in lhs.split(',') {
+        let mut slots = Vec::new();
+        for ch in part.bytes() {
+            if !ch.is_ascii_lowercase() {
+                return Err(InvalidSpec(format!(
+                    "index '{}' is not a lowercase letter",
+                    ch as char
+                )));
+            }
+            slots.push(ch - b'a');
+        }
+        inputs.push(slots);
+    }
 
     if inputs.len() != expected_inputs {
         return Err(InvalidSpec(format!(
@@ -54,38 +62,31 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
         if inp.is_empty() {
             return Err(InvalidSpec(format!("input {} has no indices", i)));
         }
-        for &ch in inp {
-            if !ch.is_ascii_lowercase() {
-                return Err(InvalidSpec(format!(
-                    "index '{}' is not a lowercase letter",
-                    ch
-                )));
-            }
-        }
     }
 
-    let output: Vec<char> = rhs.chars().collect();
-    for &ch in &output {
+    let mut output: Vec<u8> = Vec::new();
+    for ch in rhs.bytes() {
         if !ch.is_ascii_lowercase() {
             return Err(InvalidSpec(format!(
                 "output index '{}' is not a lowercase letter",
-                ch
+                ch as char
             )));
         }
+        output.push(ch - b'a');
     }
 
     // Validate: every output index must appear in at least one input
     let mut seen = [false; 26];
     for inp in &inputs {
-        for &ch in inp {
-            seen[slot(ch) as usize] = true;
+        for &s in inp {
+            seen[s as usize] = true;
         }
     }
-    for &ch in &output {
-        if !seen[slot(ch) as usize] {
+    for &s in &output {
+        if !seen[s as usize] {
             return Err(InvalidSpec(format!(
                 "output index '{}' does not appear in any input",
-                ch
+                (s + b'a') as char
             )));
         }
     }
@@ -113,19 +114,21 @@ fn validate_dims<T, Arr: NDIndex<T>>(
     let mut dims = [0usize; 26];
     let mut set = [false; 26];
     for (pi, inp) in spec.inputs.iter().enumerate() {
-        for (pos, &ch) in inp.iter().enumerate() {
-            let s = slot(ch) as usize;
+        for (pos, &s) in inp.iter().enumerate() {
+            let si = s as usize;
             let d = arrays[pi].dim(pos);
-            if set[s] {
-                if dims[s] != d {
+            if set[si] {
+                if dims[si] != d {
                     return Err(InvalidSpec(format!(
                         "dimension mismatch for index '{}': {} vs {}",
-                        ch, dims[s], d
+                        (s + b'a') as char,
+                        dims[si],
+                        d
                     )));
                 }
             } else {
-                dims[s] = d;
-                set[s] = true;
+                dims[si] = d;
+                set[si] = true;
             }
         }
     }
@@ -139,8 +142,7 @@ fn all_slots_ordered(spec: &Spec) -> SlotList {
     let mut slots = [0u8; 26];
     let mut len = 0u8;
     for inp in &spec.inputs {
-        for &ch in inp {
-            let s = slot(ch);
+        for &s in inp {
             if !seen[s as usize] {
                 seen[s as usize] = true;
                 slots[len as usize] = s;
@@ -158,6 +160,8 @@ struct Idx {
 }
 
 impl Idx {
+    const ZERO: Self = Idx { data: [0; 26], len: 0 };
+
     #[inline(always)]
     fn as_slice(&self) -> &[usize] {
         &self.data[..self.len as usize]
@@ -171,14 +175,12 @@ struct Pattern {
 }
 
 impl Pattern {
-    fn from_chars(chars: &[char]) -> Self {
+    fn from_slots(slot_indices: &[u8]) -> Self {
         let mut slots = [0u8; 26];
-        for (i, &ch) in chars.iter().enumerate() {
-            slots[i] = slot(ch);
-        }
+        slots[..slot_indices.len()].copy_from_slice(slot_indices);
         Pattern {
             slots,
-            len: chars.len() as u8,
+            len: slot_indices.len() as u8,
         }
     }
 
@@ -199,16 +201,13 @@ struct SlotList {
 }
 
 impl SlotList {
-    fn from_pattern(p: &Pattern) -> Self {
+    fn from_slots(slot_indices: &[u8]) -> Self {
+        let mut slots = [0u8; 26];
+        slots[..slot_indices.len()].copy_from_slice(slot_indices);
         SlotList {
-            slots: p.slots,
-            len: p.len,
+            slots,
+            len: slot_indices.len() as u8,
         }
-    }
-
-    fn from_chars(chars: &[char]) -> Self {
-        let p = Pattern::from_chars(chars);
-        Self::from_pattern(&p)
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -293,6 +292,32 @@ fn loop_nest_iterative(
     }
 }
 
+/// Validate output array dimensions against the spec.
+fn validate_output<T, Arr: NDIndex<T>>(
+    spec: &Spec,
+    dims: &[usize; 26],
+    out: &Arr,
+) -> Result<(), InvalidSpec> {
+    if out.ndim() != spec.output.len() {
+        return Err(InvalidSpec(format!(
+            "output has {} dimensions but spec has {} output indices",
+            out.ndim(),
+            spec.output.len()
+        )));
+    }
+    for (pos, &s) in spec.output.iter().enumerate() {
+        if out.dim(pos) != dims[s as usize] {
+            return Err(InvalidSpec(format!(
+                "output dimension {} is {} but expected {}",
+                pos,
+                out.dim(pos),
+                dims[s as usize]
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `einsum_binary(spec, a, b, out)` — binary einsum with tensor output.
 ///
 /// Spec format: `"ab,bc->ac"` (numpy-style).
@@ -306,37 +331,20 @@ where
 {
     let spec = parse_spec(spec, 2)?;
     let dims = validate_dims(&spec, &[a, b])?;
+    validate_output(&spec, &dims, out)?;
 
-    if out.ndim() != spec.output.len() {
-        return Err(InvalidSpec(format!(
-            "output has {} dimensions but spec has {} output indices",
-            out.ndim(),
-            spec.output.len()
-        )));
-    }
-    for (pos, &ch) in spec.output.iter().enumerate() {
-        if out.dim(pos) != dims[slot(ch) as usize] {
-            return Err(InvalidSpec(format!(
-                "output dimension {} is {} but expected {}",
-                pos,
-                out.dim(pos),
-                dims[slot(ch) as usize]
-            )));
-        }
-    }
-
-    let free_slots = SlotList::from_chars(&spec.output);
+    let free_slots = SlotList::from_slots(&spec.output);
     let all = all_slots_ordered(&spec);
     let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
 
-    let pat_a = Pattern::from_chars(&spec.inputs[0]);
-    let pat_b = Pattern::from_chars(&spec.inputs[1]);
-    let pat_out = Pattern::from_chars(&spec.output);
+    let pat_a = Pattern::from_slots(&spec.inputs[0]);
+    let pat_b = Pattern::from_slots(&spec.inputs[1]);
+    let pat_out = Pattern::from_slots(&spec.output);
 
     let mut vals = [0usize; 26];
-    let mut buf_a = Idx { data: [0; 26], len: 0 };
-    let mut buf_b = Idx { data: [0; 26], len: 0 };
-    let mut buf_out = Idx { data: [0; 26], len: 0 };
+    let mut buf_a = Idx::ZERO;
+    let mut buf_b = Idx::ZERO;
+    let mut buf_out = Idx::ZERO;
 
     if contracted_slots.len == 0 {
         // No contraction — direct assignment
@@ -379,34 +387,17 @@ where
 {
     let spec = parse_spec(spec, 1)?;
     let dims = validate_dims(&spec, &[a])?;
+    validate_output(&spec, &dims, out)?;
 
-    if out.ndim() != spec.output.len() {
-        return Err(InvalidSpec(format!(
-            "output has {} dimensions but spec has {} output indices",
-            out.ndim(),
-            spec.output.len()
-        )));
-    }
-    for (pos, &ch) in spec.output.iter().enumerate() {
-        if out.dim(pos) != dims[slot(ch) as usize] {
-            return Err(InvalidSpec(format!(
-                "output dimension {} is {} but expected {}",
-                pos,
-                out.dim(pos),
-                dims[slot(ch) as usize]
-            )));
-        }
-    }
-
-    let free_slots = SlotList::from_chars(&spec.output);
+    let free_slots = SlotList::from_slots(&spec.output);
     let all = all_slots_ordered(&spec);
     let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
 
-    let pat_a = Pattern::from_chars(&spec.inputs[0]);
-    let pat_out = Pattern::from_chars(&spec.output);
+    let pat_a = Pattern::from_slots(&spec.inputs[0]);
+    let pat_out = Pattern::from_slots(&spec.output);
     let mut vals = [0usize; 26];
-    let mut buf_a = Idx { data: [0; 26], len: 0 };
-    let mut buf_out = Idx { data: [0; 26], len: 0 };
+    let mut buf_a = Idx::ZERO;
+    let mut buf_out = Idx::ZERO;
 
     if contracted_slots.len == 0 {
         loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |vals| {
@@ -453,11 +444,11 @@ where
     }
 
     let all = all_slots_ordered(&spec);
-    let pat_a = Pattern::from_chars(&spec.inputs[0]);
-    let pat_b = Pattern::from_chars(&spec.inputs[1]);
+    let pat_a = Pattern::from_slots(&spec.inputs[0]);
+    let pat_b = Pattern::from_slots(&spec.inputs[1]);
     let mut vals = [0usize; 26];
-    let mut buf_a = Idx { data: [0; 26], len: 0 };
-    let mut buf_b = Idx { data: [0; 26], len: 0 };
+    let mut buf_a = Idx::ZERO;
+    let mut buf_b = Idx::ZERO;
     let mut acc: T = Default::default();
 
     loop_nest(all.as_slice(), &dims, &mut vals, &mut |vals| {
@@ -487,9 +478,9 @@ where
     }
 
     let all = all_slots_ordered(&spec);
-    let pat_a = Pattern::from_chars(&spec.inputs[0]);
+    let pat_a = Pattern::from_slots(&spec.inputs[0]);
     let mut vals = [0usize; 26];
-    let mut buf_a = Idx { data: [0; 26], len: 0 };
+    let mut buf_a = Idx::ZERO;
     let mut acc: T = Default::default();
 
     loop_nest(all.as_slice(), &dims, &mut vals, &mut |vals| {
