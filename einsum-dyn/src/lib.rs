@@ -1,7 +1,107 @@
+//! Runtime dynamic [Einstein summation](https://en.wikipedia.org/wiki/Einstein_notation)
+//! for arbitrary N-dimensional arrays.
+//!
+//! Provides four functions that interpret a numpy-style spec string at runtime:
+//!
+//! | Function | Inputs | Output |
+//! |---|---|---|
+//! | [`einsum_binary`] | two arrays | tensor (written to `&mut out`) |
+//! | [`einsum_unary`] | one array | tensor (written to `&mut out`) |
+//! | [`einsum_binary_scalar`] | two arrays | scalar (returned) |
+//! | [`einsum_unary_scalar`] | one array | scalar (returned) |
+//!
+//! # Spec format
+//!
+//! Specs use lowercase letters `a`–`z` as index names, with `->` separating
+//! inputs from output:
+//!
+//! - `"ab,bc->ac"` — matrix multiply (contract over `b`)
+//! - `"ab->ba"` — transpose (no contraction)
+//! - `"i,i->"` — dot product (scalar output, empty after `->`)
+//! - `"aa->"` — trace (scalar output)
+//!
+//! Indices present in inputs but absent from the output are contracted
+//! (summed over). All output indices must appear in at least one input.
+//!
+//! # Implementing `NDIndex`
+//!
+//! Any type can be used with these functions by implementing [`NDIndex`]:
+//!
+//! ```
+//! use einsum_dyn::{NDIndex, einsum_binary, einsum_unary, einsum_binary_scalar, einsum_unary_scalar};
+//!
+//! struct MyTensor {
+//!     data: Vec<f64>,
+//!     shape: Vec<usize>,
+//! }
+//!
+//! impl MyTensor {
+//!     fn new(shape: Vec<usize>) -> Self {
+//!         let n = shape.iter().product();
+//!         Self { data: vec![0.0; n], shape }
+//!     }
+//!     fn linear_index(&self, ix: &[usize]) -> usize {
+//!         let mut idx = 0;
+//!         let mut stride = 1;
+//!         for (&k, &dim) in ix.iter().rev().zip(self.shape.iter().rev()) {
+//!             idx += k * stride;
+//!             stride *= dim;
+//!         }
+//!         idx
+//!     }
+//! }
+//!
+//! impl NDIndex<f64> for MyTensor {
+//!     fn ndim(&self) -> usize { self.shape.len() }
+//!     fn dim(&self, axis: usize) -> usize { self.shape[axis] }
+//!     fn get(&self, ix: &[usize]) -> f64 { self.data[self.linear_index(ix)] }
+//!     fn set(&mut self, ix: &[usize], v: f64) {
+//!         let i = self.linear_index(ix);
+//!         self.data[i] = v;
+//!     }
+//! }
+//!
+//! // Matrix multiply: C = A × B
+//! let mut a = MyTensor::new(vec![2, 3]);
+//! a.data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+//! let mut b = MyTensor::new(vec![3, 2]);
+//! b.data = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+//! let mut c = MyTensor::new(vec![2, 2]);
+//! einsum_binary("ab,bc->ac", &a, &b, &mut c).unwrap();
+//! assert_eq!(c.data, vec![58.0, 64.0, 139.0, 154.0]);
+//!
+//! // Transpose
+//! let mut t = MyTensor::new(vec![3, 2]);
+//! einsum_unary("ab->ba", &a, &mut t).unwrap();
+//! assert_eq!(t.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+//!
+//! // Dot product (scalar)
+//! let mut x = MyTensor::new(vec![3]);
+//! x.data = vec![1.0, 2.0, 3.0];
+//! let mut y = MyTensor::new(vec![3]);
+//! y.data = vec![4.0, 5.0, 6.0];
+//! let dot: f64 = einsum_binary_scalar("i,i->", &x, &y).unwrap();
+//! assert_eq!(dot, 32.0);
+//!
+//! // Trace (scalar)
+//! let mut m = MyTensor::new(vec![2, 2]);
+//! m.data = vec![1.0, 2.0, 3.0, 4.0];
+//! let tr: f64 = einsum_unary_scalar("aa->", &m).unwrap();
+//! assert_eq!(tr, 5.0);
+//! ```
+//!
+//! # Feature flags
+//!
+//! - **`ndarray`** — implements `NDIndex<T>` for [`ndarray::ArrayD<T>`], so you
+//!   can pass dynamic-dimension ndarray arrays directly.
+
 use std::fmt;
 use std::ops::{AddAssign, Mul};
 
 /// Trait for N-dimensional array access.
+///
+/// Implement this for your tensor type to use the `einsum_*` functions.
+/// All index slices are ordered left-to-right (outermost dimension first).
 pub trait NDIndex<T> {
     fn ndim(&self) -> usize;
     fn dim(&self, axis: usize) -> usize;
