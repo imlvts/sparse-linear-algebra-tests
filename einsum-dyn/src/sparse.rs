@@ -172,8 +172,14 @@ pub enum VmOp {
     },
     /// End of the enclosing loop. `start_pc` points back to the loop-start.
     LoopEnd { start_pc: usize },
+    /// Initialize a dense accumulator of size `dim`, indexed by `acc_slot`.
+    /// Placed just before the loops that should accumulate.
+    AccStart { acc_slot: u8, acc_out_pos: u8, dim: usize },
+    /// Flush the dense accumulator to the output (scatter-gather: only write
+    /// and clear touched entries), then reset.
+    AccFlush,
     /// Read input values at current slot positions, multiply, and
-    /// accumulate into the output.
+    /// accumulate into the output (or into the active accumulator).
     MulAcc,
 }
 
@@ -185,6 +191,10 @@ pub struct VmProgram {
     input_patterns: Vec<Vec<u8>>,
     /// Output slot pattern.
     output_pattern: Vec<u8>,
+    /// For each input: `Some(loop_index)` of the SparseRowLoop that fully covers
+    /// it (both axes iterated by that one loop), or `None` if `get_opt` is needed.
+    /// When `Some`, `MulAcc` reads the cached sparse value instead of calling `get_opt`.
+    sparse_value_source: Vec<Option<usize>>,
 }
 
 /// Compile an einsum spec into a VM program.
@@ -332,14 +342,96 @@ pub fn compile_vm<T: Copy>(
         }
     }
 
-    // Emit flat bytecode: loop-starts, then MulAcc, then LoopEnds.
-    // Patch end_pc in each loop-start and start_pc in each LoopEnd.
+    // For each input, check if a single SparseRowLoop covers both its axes.
+    // If so, MulAcc can use the cached sparse value instead of get_opt().
+    let sparse_value_source: Vec<Option<usize>> = spec
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(inp_idx, inp_spec)| {
+            if inp_spec.len() != 2 {
+                return None;
+            }
+            // Find a SparseRowLoop in loop_order that iterates this input
+            for (loop_idx, op) in loop_order.iter().enumerate() {
+                if let VmOp::SparseRowLoop { input_idx, row_slot, col_slot, .. } = op {
+                    if *input_idx == inp_idx {
+                        // Check this loop covers both axes of this input
+                        if sparse_axes[inp_idx] == Some((*row_slot, *col_slot)) {
+                            return Some(loop_idx);
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Accumulator: if the innermost loop's slot appears in the output pattern
+    // and there's at least one other output slot, we can use a dense accumulator.
+    // We emit AccStart just inside the outermost output-slot loop and AccFlush
+    // just before each iteration's end of that same loop.
+    //
+    // For "ab,bc->ac": output=[a,c], innermost loop is c.
+    //   acc_slot=c, flush_loop_idx=0 (the 'a' loop).
+    //   Bytecode: FOR a | AccStart | FOR b(sparse) | FOR c(sparse) | MulAcc |
+    //             LoopEnd(c) | LoopEnd(b) | AccFlush | LoopEnd(a)
+    let mut acc_info: Option<(u8, u8, usize, usize)> = None; // (acc_slot, acc_out_pos, acc_dim, flush_loop_idx)
+    if let Some(last_op) = loop_order.last() {
+        let inner_slot = match last_op {
+            VmOp::DenseLoop { slot, .. } => *slot,
+            VmOp::SparseRowLoop { col_slot, .. } => *col_slot,
+            _ => unreachable!(),
+        };
+        if let Some(pos) = spec.output.iter().position(|&s| s == inner_slot) {
+            // Find innermost loop whose slot is in the output (excluding inner_slot).
+            // This is the loop after which we flush — ensures acc covers exactly
+            // one "row" of the output.
+            for (i, op) in loop_order.iter().enumerate().rev() {
+                let s = match op {
+                    VmOp::DenseLoop { slot, .. } => *slot,
+                    VmOp::SparseRowLoop { col_slot, .. } => *col_slot,
+                    _ => unreachable!(),
+                };
+                if s != inner_slot && spec.output.contains(&s) {
+                    acc_info = Some((inner_slot, pos as u8, dims[inner_slot as usize], i));
+                    break;
+                }
+            }
+        }
+    }
+
+    // Emit flat bytecode.
+    // Layout: loops... MulAcc LoopEnd... with AccStart/AccFlush injected.
     let n_loops = loop_order.len();
-    let mut ops = Vec::with_capacity(n_loops * 2 + 1);
-    ops.extend(loop_order);
+    let mut ops: Vec<VmOp> = Vec::with_capacity(n_loops * 2 + 4);
+
+    // Emit loop-starts, injecting AccStart after the flush loop
+    for (i, op) in loop_order.into_iter().enumerate() {
+        ops.push(op);
+        if let Some((acc_slot, acc_out_pos, dim, flush_idx)) = acc_info {
+            if i == flush_idx {
+                ops.push(VmOp::AccStart { acc_slot, acc_out_pos, dim });
+            }
+        }
+    }
     ops.push(VmOp::MulAcc);
+
+    // Emit LoopEnds (innermost first), injecting AccFlush before the flush loop's LoopEnd
     for i in 0..n_loops {
-        let start_pc = n_loops - 1 - i; // innermost loop first
+        let loop_idx = n_loops - 1 - i;
+        if let Some((_, _, _, flush_idx)) = acc_info {
+            if loop_idx == flush_idx {
+                ops.push(VmOp::AccFlush);
+            }
+        }
+        // Find this loop's start_pc by scanning back for the loop_idx-th loop-start
+        // The loop-starts are at varying positions due to AccStart injection.
+        // Track them: loop_idx corresponds to the loop_idx-th loop-start in ops.
+        let start_pc = ops.iter().enumerate()
+            .filter(|(_, op)| matches!(op, VmOp::DenseLoop{..} | VmOp::SparseRowLoop{..}))
+            .nth(loop_idx)
+            .unwrap().0;
         let end_pc = ops.len() + 1; // one past the LoopEnd we're about to push
         match &mut ops[start_pc] {
             VmOp::DenseLoop { end_pc: ep, .. } => *ep = end_pc,
@@ -353,7 +445,16 @@ pub fn compile_vm<T: Copy>(
         ops,
         input_patterns: spec.inputs.clone(),
         output_pattern: spec.output.clone(),
+        sparse_value_source,
     })
+}
+
+/// Accumulator state for the VM interpreter.
+struct AccState<T> {
+    acc: Vec<T>,
+    nz_cols: Vec<usize>,
+    acc_slot: u8,
+    acc_out_pos: u8,
 }
 
 impl VmProgram {
@@ -363,16 +464,24 @@ impl VmProgram {
     /// `SparseRowLoop` ops call `sparse_row_nnz` / `sparse_row_entry` on the
     /// relevant input — the compiler only emits these for inputs where
     /// `is_sparse_2d()` returned true.
+    ///
+    /// Optimizations over naive interpretation:
+    /// - Sparse values from `row_entry()` are cached and reused in `MulAcc`,
+    ///   avoiding redundant `get_opt()` binary searches.
+    /// - `AccStart`/`AccFlush` ops enable scatter-gather accumulation for the
+    ///   innermost output dimension.
     pub fn exec<T>(
         &self,
         inputs: &[&dyn NDIndex<T>],
         out: &mut dyn NDIndex<T>,
     ) where
-        T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T>,
+        T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
     {
         let mut vals = [0usize; 26];
         let mut buf = [0usize; 26];
-        self.exec_at(0, &mut vals, &mut buf, inputs, out);
+        let mut sparse_vals: Vec<T> = vec![T::default(); inputs.len()];
+        let mut acc_state: Option<AccState<T>> = None;
+        self.exec_at(0, &mut vals, &mut buf, &mut sparse_vals, &mut acc_state, inputs, out);
     }
 
     /// Execute bytecode starting at `pc`. Returns the pc after the
@@ -382,11 +491,13 @@ impl VmProgram {
         mut pc: usize,
         vals: &mut [usize; 26],
         buf: &mut [usize; 26],
+        sparse_vals: &mut [T],
+        acc_state: &mut Option<AccState<T>>,
         inputs: &[&dyn NDIndex<T>],
         out: &mut dyn NDIndex<T>,
     ) -> usize
     where
-        T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T>,
+        T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
     {
         let ops = &self.ops;
         while pc < ops.len() {
@@ -395,7 +506,7 @@ impl VmProgram {
                     let s = *slot as usize;
                     for v in 0..*dim {
                         vals[s] = v;
-                        self.exec_at(pc + 1, vals, buf, inputs, out);
+                        self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
                     }
                     pc = *end_pc;
                 }
@@ -410,23 +521,53 @@ impl VmProgram {
                     let input = inputs[*input_idx];
                     let nnz = input.sparse_row_nnz(row);
                     for ei in 0..nnz {
-                        let (col, _val) = input.sparse_row_entry(row, ei);
+                        let (col, val) = input.sparse_row_entry(row, ei);
                         vals[cs] = col;
-                        self.exec_at(pc + 1, vals, buf, inputs, out);
+                        sparse_vals[*input_idx] = val;
+                        self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
                     }
                     pc = *end_pc;
                 }
                 VmOp::LoopEnd { .. } => {
                     return pc + 1;
                 }
+                VmOp::AccStart { acc_slot, acc_out_pos, dim } => {
+                    *acc_state = Some(AccState {
+                        acc: vec![T::default(); *dim],
+                        nz_cols: Vec::new(),
+                        acc_slot: *acc_slot,
+                        acc_out_pos: *acc_out_pos,
+                    });
+                    pc += 1;
+                }
+                VmOp::AccFlush => {
+                    if let Some(st) = acc_state {
+                        let len = self.output_pattern.len();
+                        for &j in st.nz_cols.iter() {
+                            for (i, &s) in self.output_pattern.iter().enumerate() {
+                                buf[i] = vals[s as usize];
+                            }
+                            buf[st.acc_out_pos as usize] = j;
+                            out.set(&buf[..len], st.acc[j]);
+                            st.acc[j] = T::default();
+                        }
+                        st.nz_cols.clear();
+                    }
+                    pc += 1;
+                }
                 VmOp::MulAcc => {
                     let mut product = None::<T>;
                     for (i, pattern) in self.input_patterns.iter().enumerate() {
-                        let len = pattern.len();
-                        for (p, &s) in pattern.iter().enumerate() {
-                            buf[p] = vals[s as usize];
-                        }
-                        if let Some(v) = inputs[i].get_opt(&buf[..len]) {
+                        let v = if self.sparse_value_source[i].is_some() {
+                            Some(sparse_vals[i])
+                        } else {
+                            let len = pattern.len();
+                            for (p, &s) in pattern.iter().enumerate() {
+                                buf[p] = vals[s as usize];
+                            }
+                            inputs[i].get_opt(&buf[..len])
+                        };
+                        if let Some(v) = v {
                             product = Some(match product {
                                 Some(p) => p * v,
                                 None => v,
@@ -437,12 +578,20 @@ impl VmProgram {
                         }
                     }
                     if let Some(p) = product {
-                        let len = self.output_pattern.len();
-                        for (i, &s) in self.output_pattern.iter().enumerate() {
-                            buf[i] = vals[s as usize];
+                        if let Some(st) = acc_state {
+                            let idx = vals[st.acc_slot as usize];
+                            if st.acc[idx] == T::default() {
+                                st.nz_cols.push(idx);
+                            }
+                            st.acc[idx] += p;
+                        } else {
+                            let len = self.output_pattern.len();
+                            for (i, &s) in self.output_pattern.iter().enumerate() {
+                                buf[i] = vals[s as usize];
+                            }
+                            let cur = out.get(&buf[..len]);
+                            out.set(&buf[..len], cur + p);
                         }
-                        let cur = out.get(&buf[..len]);
-                        out.set(&buf[..len], cur + p);
                     }
                     pc += 1;
                 }
@@ -455,7 +604,7 @@ impl VmProgram {
 /// Convenience: compile and execute in one call.
 ///
 /// Accepts any number of inputs of any dimensionality.
-pub fn einsum_vm_oneshot<T: Copy + Default + Add<Output = T> + AddAssign + Mul<Output = T>>(
+pub fn einsum_vm_oneshot<T: Copy + Default + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq>(
     spec_str: &str,
     inputs: &[&dyn NDIndex<T>],
     out: &mut dyn NDIndex<T>,
@@ -591,8 +740,15 @@ impl std::fmt::Display for VmProgram {
                 VmOp::LoopEnd { .. } => {
                     indent -= 1;
                 }
+                VmOp::AccStart { acc_slot, dim, .. } => {
+                    let ch = (acc_slot + b'a') as char;
+                    writeln!(f, "{pad}ACC_START {ch}[0..{dim}]")?;
+                }
+                VmOp::AccFlush => {
+                    writeln!(f, "{pad}ACC_FLUSH → output")?;
+                }
                 VmOp::MulAcc => {
-                    writeln!(f, "{pad}MUL_ACC → output")?;
+                    writeln!(f, "{pad}MUL_ACC → acc")?;
                 }
             }
         }
