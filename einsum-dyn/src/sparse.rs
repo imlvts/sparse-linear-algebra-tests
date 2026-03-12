@@ -356,24 +356,6 @@ pub fn compile_vm<T: Copy>(
     })
 }
 
-/// Loop stack entry for the iterative VM interpreter.
-enum LoopState {
-    Dense {
-        slot: usize,
-        cur: usize,
-        dim: usize,
-        body_pc: usize, // pc of first instruction after the loop-start
-    },
-    Sparse {
-        input_idx: usize,
-        row_slot: usize,
-        col_slot: usize,
-        cur: usize,
-        nnz: usize,
-        body_pc: usize,
-    },
-}
-
 impl VmProgram {
     /// Execute this compiled VM program.
     ///
@@ -390,26 +372,32 @@ impl VmProgram {
     {
         let mut vals = [0usize; 26];
         let mut buf = [0usize; 26];
-        let mut stack: Vec<LoopState> = Vec::new();
-        let ops = &self.ops;
-        let mut pc = 0usize;
+        self.exec_at(0, &mut vals, &mut buf, inputs, out);
+    }
 
+    /// Execute bytecode starting at `pc`. Returns the pc after the
+    /// matching `LoopEnd` (or end of program).
+    fn exec_at<T>(
+        &self,
+        mut pc: usize,
+        vals: &mut [usize; 26],
+        buf: &mut [usize; 26],
+        inputs: &[&dyn NDIndex<T>],
+        out: &mut dyn NDIndex<T>,
+    ) -> usize
+    where
+        T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T>,
+    {
+        let ops = &self.ops;
         while pc < ops.len() {
             match &ops[pc] {
                 VmOp::DenseLoop { slot, dim, end_pc } => {
                     let s = *slot as usize;
-                    if *dim == 0 {
-                        pc = *end_pc;
-                        continue;
+                    for v in 0..*dim {
+                        vals[s] = v;
+                        self.exec_at(pc + 1, vals, buf, inputs, out);
                     }
-                    vals[s] = 0;
-                    stack.push(LoopState::Dense {
-                        slot: s,
-                        cur: 0,
-                        dim: *dim,
-                        body_pc: pc + 1,
-                    });
-                    pc += 1;
+                    pc = *end_pc;
                 }
                 VmOp::SparseRowLoop {
                     input_idx,
@@ -421,63 +409,15 @@ impl VmProgram {
                     let cs = *col_slot as usize;
                     let input = inputs[*input_idx];
                     let nnz = input.sparse_row_nnz(row);
-                    if nnz == 0 {
-                        pc = *end_pc;
-                        continue;
+                    for ei in 0..nnz {
+                        let (col, _val) = input.sparse_row_entry(row, ei);
+                        vals[cs] = col;
+                        self.exec_at(pc + 1, vals, buf, inputs, out);
                     }
-                    let (col, _val) = input.sparse_row_entry(row, 0);
-                    vals[cs] = col;
-                    stack.push(LoopState::Sparse {
-                        input_idx: *input_idx,
-                        row_slot: *row_slot as usize,
-                        col_slot: cs,
-                        cur: 0,
-                        nnz,
-                        body_pc: pc + 1,
-                    });
-                    pc += 1;
+                    pc = *end_pc;
                 }
-                VmOp::LoopEnd { start_pc: _ } => {
-                    let frame = stack.last_mut().unwrap();
-                    match frame {
-                        LoopState::Dense {
-                            slot,
-                            cur,
-                            dim,
-                            body_pc,
-                        } => {
-                            *cur += 1;
-                            if *cur < *dim {
-                                vals[*slot] = *cur;
-                                pc = *body_pc;
-                            } else {
-                                stack.pop();
-                                pc += 1;
-                            }
-                        }
-                        LoopState::Sparse {
-                            input_idx,
-                            row_slot,
-                            col_slot,
-                            cur,
-                            nnz,
-                            body_pc,
-                        } => {
-                            *cur += 1;
-                            if *cur < *nnz {
-                                let (col, _val) =
-                                    inputs[*input_idx].sparse_row_entry(
-                                        vals[*row_slot],
-                                        *cur,
-                                    );
-                                vals[*col_slot] = col;
-                                pc = *body_pc;
-                            } else {
-                                stack.pop();
-                                pc += 1;
-                            }
-                        }
-                    }
+                VmOp::LoopEnd { .. } => {
+                    return pc + 1;
                 }
                 VmOp::MulAcc => {
                     let mut product = None::<T>;
@@ -508,6 +448,7 @@ impl VmProgram {
                 }
             }
         }
+        pc
     }
 }
 
