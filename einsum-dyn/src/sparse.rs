@@ -159,16 +159,21 @@ where
 pub enum VmOp {
     /// Dense loop: iterate `slot` from 0 to `dim-1`.
     /// `end_pc` points one past the matching `LoopEnd`.
-    DenseLoop { slot: u8, dim: usize, end_pc: usize },
+    /// When `fused`, the body is a single `MulAcc` — the loop runs the
+    /// multiply-accumulate inline without recursing into `exec_at`.
+    DenseLoop { slot: u8, dim: usize, end_pc: usize, fused: bool },
     /// Sparse row iteration: for each non-zero in `input[input_idx]`
     /// at the row given by `vals[row_slot]`, set `vals[col_slot]` to the
     /// column index.
     /// `end_pc` points one past the matching `LoopEnd`.
+    /// When `fused`, the body is a single `MulAcc` — the loop runs the
+    /// multiply-accumulate inline without recursing into `exec_at`.
     SparseRowLoop {
         input_idx: usize,
         row_slot: u8,
         col_slot: u8,
         end_pc: usize,
+        fused: bool,
     },
     /// End of the enclosing loop. `start_pc` points back to the loop-start.
     LoopEnd { start_pc: usize },
@@ -301,6 +306,7 @@ pub fn compile_vm<T: Copy>(
                             row_slot: *ax0,
                             col_slot: s,
                             end_pc: 0, // patched below
+                            fused: false, // patched below
                         });
                         fixed[s as usize] = true;
                         n_fixed += 1;
@@ -336,6 +342,7 @@ pub fn compile_vm<T: Copy>(
                 slot: s,
                 dim: dims[s as usize],
                 end_pc: 0, // patched below
+                fused: false, // patched below
             });
             fixed[s as usize] = true;
             n_fixed += 1;
@@ -441,6 +448,19 @@ pub fn compile_vm<T: Copy>(
         ops.push(VmOp::LoopEnd { start_pc });
     }
 
+    // Fusion: if a loop's body is just MulAcc (followed by LoopEnd), mark it fused.
+    // The loop will inline the multiply-accumulate without recursing.
+    for pc in 0..ops.len() {
+        let is_loop = matches!(&ops[pc], VmOp::DenseLoop{..} | VmOp::SparseRowLoop{..});
+        if is_loop && matches!(&ops[pc + 1], VmOp::MulAcc) {
+            match &mut ops[pc] {
+                VmOp::DenseLoop { fused, .. } => *fused = true,
+                VmOp::SparseRowLoop { fused, .. } => *fused = true,
+                _ => unreachable!(),
+            }
+        }
+    }
+
     Ok(VmProgram {
         ops,
         input_patterns: spec.inputs.clone(),
@@ -502,11 +522,18 @@ impl VmProgram {
         let ops = &self.ops;
         while pc < ops.len() {
             match &ops[pc] {
-                VmOp::DenseLoop { slot, dim, end_pc } => {
+                VmOp::DenseLoop { slot, dim, end_pc, fused } => {
                     let s = *slot as usize;
-                    for v in 0..*dim {
-                        vals[s] = v;
-                        self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
+                    if *fused {
+                        for v in 0..*dim {
+                            vals[s] = v;
+                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, out);
+                        }
+                    } else {
+                        for v in 0..*dim {
+                            vals[s] = v;
+                            self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
+                        }
                     }
                     pc = *end_pc;
                 }
@@ -515,16 +542,26 @@ impl VmProgram {
                     row_slot,
                     col_slot,
                     end_pc,
+                    fused,
                 } => {
                     let row = vals[*row_slot as usize];
                     let cs = *col_slot as usize;
                     let input = inputs[*input_idx];
                     let nnz = input.sparse_row_nnz(row);
-                    for ei in 0..nnz {
-                        let (col, val) = input.sparse_row_entry(row, ei);
-                        vals[cs] = col;
-                        sparse_vals[*input_idx] = val;
-                        self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
+                    if *fused {
+                        for ei in 0..nnz {
+                            let (col, val) = input.sparse_row_entry(row, ei);
+                            vals[cs] = col;
+                            sparse_vals[*input_idx] = val;
+                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, out);
+                        }
+                    } else {
+                        for ei in 0..nnz {
+                            let (col, val) = input.sparse_row_entry(row, ei);
+                            vals[cs] = col;
+                            sparse_vals[*input_idx] = val;
+                            self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
+                        }
                     }
                     pc = *end_pc;
                 }
@@ -556,48 +593,65 @@ impl VmProgram {
                     pc += 1;
                 }
                 VmOp::MulAcc => {
-                    let mut product = None::<T>;
-                    for (i, pattern) in self.input_patterns.iter().enumerate() {
-                        let v = if self.sparse_value_source[i].is_some() {
-                            Some(sparse_vals[i])
-                        } else {
-                            let len = pattern.len();
-                            for (p, &s) in pattern.iter().enumerate() {
-                                buf[p] = vals[s as usize];
-                            }
-                            inputs[i].get_opt(&buf[..len])
-                        };
-                        if let Some(v) = v {
-                            product = Some(match product {
-                                Some(p) => p * v,
-                                None => v,
-                            });
-                        } else {
-                            product = None;
-                            break;
-                        }
-                    }
-                    if let Some(p) = product {
-                        if let Some(st) = acc_state {
-                            let idx = vals[st.acc_slot as usize];
-                            if st.acc[idx] == T::default() {
-                                st.nz_cols.push(idx);
-                            }
-                            st.acc[idx] += p;
-                        } else {
-                            let len = self.output_pattern.len();
-                            for (i, &s) in self.output_pattern.iter().enumerate() {
-                                buf[i] = vals[s as usize];
-                            }
-                            let cur = out.get(&buf[..len]);
-                            out.set(&buf[..len], cur + p);
-                        }
-                    }
+                    self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, out);
                     pc += 1;
                 }
             }
         }
         pc
+    }
+
+    /// Compute one multiply-accumulate step: read inputs, multiply, write to
+    /// accumulator or output.
+    #[inline]
+    fn mul_acc<T>(
+        &self,
+        vals: &[usize; 26],
+        buf: &mut [usize; 26],
+        sparse_vals: &[T],
+        acc_state: &mut Option<AccState<T>>,
+        inputs: &[&dyn NDIndex<T>],
+        out: &mut dyn NDIndex<T>,
+    ) where
+        T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
+    {
+        let mut product = None::<T>;
+        for (i, pattern) in self.input_patterns.iter().enumerate() {
+            let v = if self.sparse_value_source[i].is_some() {
+                Some(sparse_vals[i])
+            } else {
+                let len = pattern.len();
+                for (p, &s) in pattern.iter().enumerate() {
+                    buf[p] = vals[s as usize];
+                }
+                inputs[i].get_opt(&buf[..len])
+            };
+            if let Some(v) = v {
+                product = Some(match product {
+                    Some(p) => p * v,
+                    None => v,
+                });
+            } else {
+                product = None;
+                break;
+            }
+        }
+        if let Some(p) = product {
+            if let Some(st) = acc_state {
+                let idx = vals[st.acc_slot as usize];
+                if st.acc[idx] == T::default() {
+                    st.nz_cols.push(idx);
+                }
+                st.acc[idx] += p;
+            } else {
+                let len = self.output_pattern.len();
+                for (i, &s) in self.output_pattern.iter().enumerate() {
+                    buf[i] = vals[s as usize];
+                }
+                let cur = out.get(&buf[..len]);
+                out.set(&buf[..len], cur + p);
+            }
+        }
     }
 }
 
@@ -718,22 +772,25 @@ impl std::fmt::Display for VmProgram {
         for op in &self.ops {
             let pad = "  ".repeat(indent);
             match op {
-                VmOp::DenseLoop { slot, dim, .. } => {
+                VmOp::DenseLoop { slot, dim, fused, .. } => {
                     let ch = (slot + b'a') as char;
-                    writeln!(f, "{pad}FOR {ch} IN 0..{dim}")?;
+                    let tag = if *fused { "  [FUSED]" } else { "" };
+                    writeln!(f, "{pad}FOR {ch} IN 0..{dim}{tag}")?;
                     indent += 1;
                 }
                 VmOp::SparseRowLoop {
                     input_idx,
                     row_slot,
                     col_slot,
+                    fused,
                     ..
                 } => {
                     let row_ch = (row_slot + b'a') as char;
                     let col_ch = (col_slot + b'a') as char;
+                    let tag = if *fused { "  [SPARSE,FUSED]" } else { "  [SPARSE]" };
                     writeln!(
                         f,
-                        "{pad}FOR ({col_ch}, val) IN input[{input_idx}].row({row_ch})  [SPARSE]"
+                        "{pad}FOR ({col_ch}, val) IN input[{input_idx}].row({row_ch}){tag}"
                     )?;
                     indent += 1;
                 }

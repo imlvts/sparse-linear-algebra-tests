@@ -65,11 +65,24 @@ FOR a IN 0..n
 
 **Code:** `einsum-dyn/src/sparse.rs` — `compile_vm()`, `VmProgram::exec()`, `VmOp` enum
 
-**Verdict:** 2.5–12× slower than CSR matmul due to:
-- `get_opt()` calls at MulAcc (binary search in CSR) instead of direct value access
-  from `row_entry()` — this is the dominant cost
-- Recursive dispatch overhead per bytecode op
-- Element-by-element output writes via `get`/`set` (no accumulator batching)
+Three optimizations reduce the overhead from 10–12× to 2.7–5.3×:
+
+1. **Sparse value caching:** `SparseRowLoop` stores the value from `row_entry()`
+   and `MulAcc` reuses it, avoiding redundant `get_opt()` binary searches for
+   inputs fully covered by a sparse loop.
+
+2. **Dense accumulator (`AccStart`/`AccFlush`):** When the innermost loop slot
+   appears in the output, the compiler emits `AccStart` (allocate dense vec) and
+   `AccFlush` (scatter-gather write + clear) ops. This batches output writes
+   instead of calling `get`/`set` per element. ~2× speedup on dense-output cases.
+
+3. **Fused inner loops:** When a loop's body is a single `MulAcc`, the loop is
+   marked `fused` and calls `mul_acc()` inline instead of recursing into
+   `exec_at()`. Eliminates per-element recursive dispatch overhead. ~15% speedup.
+
+**Verdict:** 2.7–5.3× slower than CSR matmul after optimizations. The remaining
+gap is the per-element `mul_acc` overhead (index gathering, `Option` product
+chain, accumulator branch) vs CSR's tight `a_val * b_val` inner loop.
 
 The VM's strength is **flexibility**: it handles arbitrary specs (any number of
 inputs, any dimensionality, mixed sparse/dense) without hardcoding the matmul
@@ -78,12 +91,12 @@ would just require new `VmOp` variants.
 
 **Capabilities vs other approaches:**
 
-| | sparse-driven | hash | VM |
+| | sparse-driven | VM | hash |
 |---|---|---|---|
-| Speed vs CSR | 0.61–1.48× (fastest) | 1.95–6.71× | 2.54–12.25× (slowest) |
-| Specs | matmul only | matmul only | any einsum |
-| Inputs | 2D sparse only | 2D sparse only | any dim, mixed sparse/dense |
-| Memory | O(n) dense vec/row | O(nnz) hash/row | O(depth) call stack |
+| Speed vs CSR | 0.62–1.55× (fastest) | 2.68–5.28× | 1.95–6.62× |
+| Specs | matmul only | any einsum | matmul only |
+| Inputs | 2D sparse only | any dim, mixed sparse/dense | 2D sparse only |
+| Memory | O(n) dense vec/row | O(n) acc + call stack | O(nnz) hash/row |
 
 ---
 
@@ -110,34 +123,42 @@ per row and a dense accumulator would waste memory.
 ```
 config                            n     nnz     baseline       sparse           VM         hash   CSR matmul
 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-lattice 10³ full (26 e/n)      1000   26000  17438703 µs      1394 µs     21701 µs     11928 µs      2017 µs
-lattice 10³ thin (4 e/n)       1000    4070  14053584 µs       164 µs       612 µs       480 µs       238 µs
-lattice 15³ full (26 e/n)      3375   87750         skip      5759 µs     75223 µs     41175 µs      6139 µs
-lattice 15³ thin (4 e/n)       3375   13844         skip       955 µs      3394 µs      2020 µs       762 µs
-lattice 20³ thin (4 e/n)       8000   31936         skip      2515 µs      9191 µs      5063 µs      1702 µs
-random 1000n 5000e             1000    4987  14747102 µs       184 µs       773 µs       592 µs       304 µs
-random 2000n 10000e            2000    9983         skip       669 µs      1936 µs      1303 µs       601 µs
+lattice 10³ full (26 e/n)      1000   26000  17582417 µs      1822 µs      8588 µs     12149 µs      1920 µs
+lattice 10³ thin (4 e/n)       1000    4070  13946100 µs       168 µs       661 µs       497 µs       242 µs
+lattice 15³ full (26 e/n)      3375   87750         skip      5866 µs     30604 µs     41713 µs      6303 µs
+lattice 15³ thin (4 e/n)       3375   13844         skip       967 µs      3178 µs      2038 µs       802 µs
+lattice 20³ thin (4 e/n)       8000   31936         skip      2732 µs      9312 µs      5110 µs      1764 µs
+random 1000n 5000e             1000    4987  14604412 µs       193 µs       837 µs       609 µs       312 µs
+random 2000n 10000e            2000    9983         skip       717 µs      1913 µs      1331 µs       616 µs
 ```
 
 ### Slowdown relative to CSR matmul (lower = faster)
 
 | Config | sparse/CSR | VM/CSR | hash/CSR |
 |--------|-----------|--------|----------|
-| 10³ full | 0.69× | 10.76× | 5.91× |
-| 10³ thin | 0.69× | 2.57× | 2.02× |
-| 15³ full | 0.94× | 12.25× | 6.71× |
-| 15³ thin | 1.25× | 4.45× | 2.65× |
-| 20³ thin | 1.48× | 5.40× | 2.97× |
-| random 1k | 0.61× | 2.54× | 1.95× |
-| random 2k | 1.11× | 3.22× | 2.17× |
+| 10³ full | 0.95× | 4.47× | 6.33× |
+| 10³ thin | 0.69× | 2.73× | 2.05× |
+| 15³ full | 0.93× | 4.86× | 6.62× |
+| 15³ thin | 1.21× | 3.96× | 2.54× |
+| 20³ thin | 1.55× | 5.28× | 2.90× |
+| random 1k | 0.62× | 2.68× | 1.95× |
+| random 2k | 1.16× | 3.11× | 2.16× |
+
+### VM optimization progression
+
+| Config | naive VM | +sparse vals +acc | +fused | CSR matmul |
+|--------|----------|-------------------|--------|------------|
+| 10³ full | 21,701 µs (10.76×) | 9,914 µs (5.17×) | 8,588 µs (4.47×) | 1,920 µs |
+| 15³ full | 75,223 µs (12.25×) | 35,311 µs (5.75×) | 30,604 µs (4.86×) | 6,303 µs |
+| 20³ thin | 9,191 µs (5.40×) | 9,578 µs (5.43×) | 9,312 µs (5.28×) | 1,764 µs |
 
 ### Speedup vs baseline (where available)
 
 | Config | sparse | VM | hash | CSR matmul |
 |--------|--------|-----|------|-----------|
-| 10³ full | 12,510× | 803× | 1,462× | 8,645× |
-| 10³ thin | 85,693× | 22,964× | 29,278× | 59,049× |
-| random 1k | 80,147× | 19,077× | 24,911× | 48,510× |
+| 10³ full | 9,650× | 2,048× | 1,447× | 9,157× |
+| 10³ thin | 83,036× | 21,098× | 28,060× | 57,628× |
+| random 1k | 75,669× | 17,449× | 23,980× | 46,808× |
 
 ## Key Takeaways
 
@@ -148,16 +169,20 @@ random 2000n 10000e            2000    9983         skip       669 µs      1936
    The scatter-gather pattern (only clear touched entries) is critical for performance.
 
 3. **The VM approach is the most flexible** — it handles any einsum spec with mixed
-   sparse/dense inputs of any dimensionality. It pays 2.5–12× overhead vs CSR matmul,
-   mostly from `get_opt()` binary search at each MulAcc instead of direct `row_entry()`
-   value access. The flat bytecode with recursive PC dispatch keeps interpreter overhead
-   minimal.
+   sparse/dense inputs of any dimensionality. After three rounds of optimization
+   (sparse value caching, dense accumulator, fused inner loops), it achieves
+   2.7–5.3× of CSR matmul, down from the initial 10–12×. The remaining gap is
+   the per-element `mul_acc` overhead vs CSR's tight inner loop.
 
-4. **Hash accumulator loses to dense accumulator** at these sparsity levels. It would
+4. **VM now beats hash on dense-output cases** (4.47× vs 6.33× for 10³ full)
+   thanks to the accumulator. Hash still wins on thin graphs where its
+   per-element overhead is lower than the VM's index-gathering machinery.
+
+5. **Hash accumulator loses to dense accumulator** at these sparsity levels. It would
    only win for very large, extremely sparse outputs where the dense accumulator's
    O(n) clear cost dominates.
 
-5. **The `Sparse2D` trait** (4 methods: `nnz`, `n_rows`, `row_nnz`, `row_entry`) is
+6. **The `Sparse2D` trait** (4 methods: `nnz`, `n_rows`, `row_nnz`, `row_entry`) is
    the right abstraction. It maps zero-cost to CSR and enables all three sparse approaches.
 
 ## Files Modified
