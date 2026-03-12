@@ -6,6 +6,7 @@ use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Rem, Sub};
 use num_traits::{Num, One, Zero};
 use rand::Rng;
 use sprs::{CsMat, TriMat};
+use einsum_dyn::NDIndex;
 
 // ---------------------------------------------------------------------------
 // Sat64 — newtype over Saturating<u64> with num_traits impls for sprs
@@ -411,6 +412,16 @@ impl SprsMatrix {
 fn same_structure(a: &CsMat<Sat64>, b: &CsMat<Sat64>) -> bool {
     a.indptr().raw_storage() == b.indptr().raw_storage()
         && a.indices() == b.indices()
+}
+
+impl NDIndex<u64> for SprsMatrix {
+    fn ndim(&self) -> usize { 2 }
+    fn dim(&self, _axis: usize) -> usize { self.n }
+    fn get(&self, ix: &[usize]) -> u64 { SprsMatrix::get(self, ix[0], ix[1]) }
+    fn set(&mut self, _ix: &[usize], _v: u64) { panic!("SprsMatrix is immutable after construction") }
+    fn get_opt(&self, ix: &[usize]) -> Option<u64> {
+        self.mat.get(ix[0], ix[1]).map(|v| v.0)
+    }
 }
 
 #[cfg(test)]

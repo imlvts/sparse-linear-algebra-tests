@@ -82,14 +82,14 @@ fn main() {
     println!("=== einsum benchmark: proc-macro vs dynamic ===\n");
 
     // --- Matmul NxN ---
-    for &n in &[16, 64, 128, 256] {
+    for &n in &[16, 64, 128, 256, 512, 1024] {
         println!("--- matmul {n}×{n} ---");
         let mut a = T::new(vec![n, n]);
         let mut b = T::new(vec![n, n]);
         fill_rand(&mut a, 42);
         fill_rand(&mut b, 123);
 
-        let iters = if n <= 64 { 1000 } else if n <= 128 { 100 } else { 10 };
+        let iters = if n <= 64 { 1000 } else if n <= 128 { 100 } else if n <= 256 { 10 } else { 3 };
 
         let pm = bench("proc-macro", iters, || {
             let _ = std::hint::black_box(pm_matmul(&a, &b));
@@ -103,15 +103,14 @@ fn main() {
     }
 
     // --- Attention bhqd,bhkd->bhqk ---
-    {
-        let (b, h, q, k, d) = (2, 8, 32, 32, 64);
+    for &(b, h, q, k, d) in &[(2, 8, 32, 32, 64), (4, 12, 64, 64, 128)] {
         println!("--- attention b={b} h={h} q={q} k={k} d={d} ---");
         let mut qm = T::new(vec![b, h, q, d]);
         let mut km = T::new(vec![b, h, k, d]);
         fill_rand(&mut qm, 42);
         fill_rand(&mut km, 99);
 
-        let iters = 20;
+        let iters = if q <= 32 { 20 } else { 3 };
         let pm = bench("proc-macro", iters, || {
             let _ = std::hint::black_box(pm_attention(&qm, &km));
         });
@@ -124,13 +123,12 @@ fn main() {
     }
 
     // --- Transpose ---
-    {
-        let n = 256;
+    for &n in &[256, 1024] {
         println!("--- transpose {n}×{n} ---");
         let mut a = T::new(vec![n, n]);
         fill_rand(&mut a, 42);
 
-        let iters = 200;
+        let iters = if n <= 256 { 200 } else { 20 };
         let pm = bench("proc-macro", iters, || {
             let _ = std::hint::black_box(pm_transpose(&a));
         });
@@ -143,15 +141,14 @@ fn main() {
     }
 
     // --- Dot product ---
-    {
-        let n = 10000;
+    for &n in &[10000, 100000, 1000000] {
         println!("--- dot product n={n} ---");
         let mut a = T::new(vec![n]);
         let mut b = T::new(vec![n]);
         fill_rand(&mut a, 42);
         fill_rand(&mut b, 99);
 
-        let iters = 2000;
+        let iters = if n <= 10000 { 2000 } else if n <= 100000 { 200 } else { 20 };
         let pm = bench("proc-macro", iters, || {
             let _ = std::hint::black_box(pm_dot(&a, &b));
         });
@@ -163,13 +160,12 @@ fn main() {
     }
 
     // --- Trace ---
-    {
-        let n = 500;
+    for &n in &[500, 2000] {
         println!("--- trace {n}×{n} ---");
         let mut m = T::new(vec![n, n]);
         fill_rand(&mut m, 42);
 
-        let iters = 2000;
+        let iters = if n <= 500 { 2000 } else { 200 };
         let pm = bench("proc-macro", iters, || {
             let _ = std::hint::black_box(pm_trace(&m));
         });

@@ -93,7 +93,7 @@ would just require new `VmOp` variants.
 
 | | sparse-driven | VM | hash |
 |---|---|---|---|
-| Speed vs CSR | 0.62–1.55× (fastest) | 2.68–5.28× | 1.95–6.62× |
+| Slowdown vs CSR | 0.62–1.55× (fastest) | 2.68–5.28× | 1.95–6.62× |
 | Specs | matmul only | any einsum | matmul only |
 | Inputs | 2D sparse only | any dim, mixed sparse/dense | 2D sparse only |
 | Memory | O(n) dense vec/row | O(n) acc + call stack | O(nnz) hash/row |

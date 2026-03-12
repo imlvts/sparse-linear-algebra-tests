@@ -95,6 +95,8 @@
 //! - **`ndarray`** — implements `NDIndex<T>` for [`ndarray::ArrayD<T>`], so you
 //!   can pass dynamic-dimension ndarray arrays directly.
 
+pub mod sparse;
+
 use std::fmt;
 use std::ops::{AddAssign, Mul};
 
@@ -107,6 +109,29 @@ pub trait NDIndex<T> {
     fn dim(&self, axis: usize) -> usize;
     fn get(&self, indices: &[usize]) -> T;
     fn set(&mut self, indices: &[usize], val: T);
+
+    /// Returns `None` for structurally absent (zero) entries.
+    ///
+    /// Dense implementations use the default, which wraps `get` in `Some`.
+    /// Sparse implementations should override this to return `None` for
+    /// entries not present in the sparse structure.
+    fn get_opt(&self, indices: &[usize]) -> Option<T> {
+        Some(self.get(indices))
+    }
+
+    /// Whether this array is a 2D sparse matrix supporting row iteration
+    /// via `sparse_row_nnz` and `sparse_row_entry`. Default: false.
+    fn is_sparse_2d(&self) -> bool { false }
+
+    /// Number of non-zero entries in the given row.
+    /// Only meaningful when `is_sparse_2d()` returns true.
+    fn sparse_row_nnz(&self, _row: usize) -> usize { 0 }
+
+    /// Get the `idx`-th non-zero entry in the given row as `(col, value)`.
+    /// Only meaningful when `is_sparse_2d()` returns true.
+    fn sparse_row_entry(&self, _row: usize, _idx: usize) -> (usize, T) {
+        panic!("sparse_row_entry called on non-sparse array")
+    }
 }
 
 #[cfg(feature = "ndarray")]
@@ -180,12 +205,12 @@ impl std::error::Error for InvalidSpec {}
 
 /// Parsed einsum specification. All index chars are stored as slot indices
 /// (`b'a'` → 0, `b'b'` → 1, ..., `b'z'` → 25).
-struct Spec {
+pub(crate) struct Spec {
     inputs: Vec<Vec<u8>>,
     output: Vec<u8>,
 }
 
-fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
+pub(crate) fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
     let spec = spec.replace(' ', "");
 
     let (lhs, rhs) = spec
@@ -243,7 +268,7 @@ fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
 
 /// Validates that array dimensions match the spec. Returns dims as a `[usize; 26]`
 /// array (indexed by slot). Unused slots are 0.
-fn validate_dims<T, Arr: NDIndex<T>>(
+pub(crate) fn validate_dims<T, Arr: NDIndex<T>>(
     spec: &Spec,
     arrays: &[&Arr],
 ) -> Result<[usize; 26], InvalidSpec> {
@@ -438,7 +463,7 @@ fn loop_nest_iterative(
 }
 
 /// Validate output array dimensions against the spec.
-fn validate_output<T, Arr: NDIndex<T>>(
+pub(crate) fn validate_output<T, Arr: NDIndex<T>>(
     spec: &Spec,
     dims: &[usize; 26],
     out: &Arr,
@@ -467,10 +492,11 @@ fn validate_output<T, Arr: NDIndex<T>>(
 /// All indices in the output must appear in at least one input.
 /// Indices present in inputs but absent from the output are contracted (summed over).
 /// The output array must already have the correct shape.
-pub fn einsum_binary<T, Arr>(spec: &str, a: &Arr, b: &Arr, out: &mut Arr) -> Result<(), InvalidSpec>
+pub fn einsum_binary<T, In, Out>(spec: &str, a: &In, b: &In, out: &mut Out) -> Result<(), InvalidSpec>
 where
     T: Default + Copy + AddAssign + Mul<Output = T>,
-    Arr: NDIndex<T>,
+    In: NDIndex<T>,
+    Out: NDIndex<T>,
 {
     let spec = parse_spec(spec, 2)?;
     let dims = validate_dims(&spec, &[a, b])?;
@@ -495,7 +521,11 @@ where
             pat_a.gather(vals, &mut buf_a);
             pat_b.gather(vals, &mut buf_b);
             pat_out.gather(vals, &mut buf_out);
-            out.set(buf_out.as_slice(), a.get(buf_a.as_slice()) * b.get(buf_b.as_slice()));
+            let v = match (a.get_opt(buf_a.as_slice()), b.get_opt(buf_b.as_slice())) {
+                (Some(av), Some(bv)) => av * bv,
+                _ => Default::default(),
+            };
+            out.set(buf_out.as_slice(), v);
         });
     } else {
         // With contraction — accumulate per output element
@@ -509,7 +539,11 @@ where
                 &mut |vals| {
                     pat_a.gather(vals, &mut buf_a);
                     pat_b.gather(vals, &mut buf_b);
-                    acc += a.get(buf_a.as_slice()) * b.get(buf_b.as_slice());
+                    if let (Some(av), Some(bv)) =
+                        (a.get_opt(buf_a.as_slice()), b.get_opt(buf_b.as_slice()))
+                    {
+                        acc += av * bv;
+                    }
                 },
             );
             pat_out.gather(free_vals, &mut buf_out);
@@ -523,10 +557,11 @@ where
 /// `einsum_unary(spec, a, out)` — unary einsum with tensor output.
 ///
 /// Spec format: `"ab->ba"` (numpy-style).
-pub fn einsum_unary<T, Arr>(spec: &str, a: &Arr, out: &mut Arr) -> Result<(), InvalidSpec>
+pub fn einsum_unary<T, In, Out>(spec: &str, a: &In, out: &mut Out) -> Result<(), InvalidSpec>
 where
     T: Default + Copy + AddAssign + Mul<Output = T>,
-    Arr: NDIndex<T>,
+    In: NDIndex<T>,
+    Out: NDIndex<T>,
 {
     let spec = parse_spec(spec, 1)?;
     let dims = validate_dims(&spec, &[a])?;
@@ -546,7 +581,8 @@ where
         loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |vals| {
             pat_a.gather(vals, &mut buf_a);
             pat_out.gather(vals, &mut buf_out);
-            out.set(buf_out.as_slice(), a.get(buf_a.as_slice()));
+            let v = a.get_opt(buf_a.as_slice()).unwrap_or_default();
+            out.set(buf_out.as_slice(), v);
         });
     } else {
         loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |free_vals| {
@@ -558,7 +594,9 @@ where
                 &mut inner_vals,
                 &mut |vals| {
                     pat_a.gather(vals, &mut buf_a);
-                    acc += a.get(buf_a.as_slice());
+                    if let Some(av) = a.get_opt(buf_a.as_slice()) {
+                        acc += av;
+                    }
                 },
             );
             pat_out.gather(free_vals, &mut buf_out);
@@ -595,7 +633,11 @@ where
     loop_nest(all.as_slice(), &dims, &mut vals, &mut |vals| {
         pat_a.gather(vals, &mut buf_a);
         pat_b.gather(vals, &mut buf_b);
-        acc += a.get(buf_a.as_slice()) * b.get(buf_b.as_slice());
+        if let (Some(av), Some(bv)) =
+            (a.get_opt(buf_a.as_slice()), b.get_opt(buf_b.as_slice()))
+        {
+            acc += av * bv;
+        }
     });
 
     Ok(acc)
@@ -624,7 +666,9 @@ where
 
     loop_nest(all.as_slice(), &dims, &mut vals, &mut |vals| {
         pat_a.gather(vals, &mut buf_a);
-        acc += a.get(buf_a.as_slice());
+        if let Some(av) = a.get_opt(buf_a.as_slice()) {
+            acc += av;
+        }
     });
 
     Ok(acc)

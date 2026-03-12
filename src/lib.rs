@@ -11,6 +11,7 @@ pub mod graph_csr_btree;
 pub mod graph_sprs;
 pub mod graph_magnus;
 pub mod dense_btree;
+pub mod graph_csr_builder;
 
 pub use traits::*;
 pub use dense::*;

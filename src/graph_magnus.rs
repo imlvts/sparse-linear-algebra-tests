@@ -4,6 +4,7 @@ use rand::Rng;
 use magnus::{SparseMatrixCSR, magnus_spgemm, magnus_spgemm_parallel, MagnusConfig};
 
 use crate::graph_sprs::Sat64;
+use einsum_dyn::NDIndex;
 
 /// Sparse integer matrix backed by MAGNUS SpGEMM library (ICS'25 row-categorization algorithm).
 #[derive(Clone, Debug)]
@@ -426,6 +427,22 @@ impl MagnusMatrix {
                 }
             }
             println!();
+        }
+    }
+}
+
+impl NDIndex<u64> for MagnusMatrix {
+    fn ndim(&self) -> usize { 2 }
+    fn dim(&self, _axis: usize) -> usize { self.n }
+    fn get(&self, ix: &[usize]) -> u64 { MagnusMatrix::get(self, ix[0], ix[1]) }
+    fn set(&mut self, _ix: &[usize], _v: u64) { panic!("MagnusMatrix is immutable after construction") }
+    fn get_opt(&self, ix: &[usize]) -> Option<u64> {
+        let (r, c) = (ix[0], ix[1]);
+        let start = self.mat.row_ptr[r];
+        let end = self.mat.row_ptr[r + 1];
+        match self.mat.col_idx[start..end].binary_search(&c) {
+            Ok(i) => Some(self.mat.values[start + i].0),
+            Err(_) => None,
         }
     }
 }

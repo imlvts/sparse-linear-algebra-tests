@@ -5,6 +5,7 @@ use rand::Rng;
 use rayon::prelude::*;
 
 use std::num::Saturating;
+use einsum_dyn::NDIndex;
 
 /// Set to `true` to make `matmul_par` print row-progress to stderr.
 pub static MATMUL_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -832,6 +833,43 @@ impl CsrMatrix {
     }
 }
 
+impl NDIndex<Val> for CsrMatrix {
+    fn ndim(&self) -> usize { 2 }
+    fn dim(&self, _axis: usize) -> usize { self.n as usize }
+    fn get(&self, ix: &[usize]) -> Val { CsrMatrix::get(self, ix[0] as NodeId, ix[1] as NodeId) }
+    fn set(&mut self, _ix: &[usize], _v: Val) { panic!("CsrMatrix is immutable after construction") }
+    fn get_opt(&self, ix: &[usize]) -> Option<Val> {
+        let r = ix[0];
+        let c = ix[1] as NodeId;
+        let start = self.row_ptr[r];
+        let end = self.row_ptr[r + 1];
+        match self.col_idx[start..end].binary_search(&c) {
+            Ok(i) => Some(self.values[start + i]),
+            Err(_) => None,
+        }
+    }
+    fn is_sparse_2d(&self) -> bool { true }
+    fn sparse_row_nnz(&self, row: usize) -> usize {
+        self.row_ptr[row + 1] - self.row_ptr[row]
+    }
+    fn sparse_row_entry(&self, row: usize, idx: usize) -> (usize, Val) {
+        let start = self.row_ptr[row];
+        (self.col_idx[start + idx] as usize, self.values[start + idx])
+    }
+}
+
+impl einsum_dyn::sparse::Sparse2D<Val> for CsrMatrix {
+    fn nnz(&self) -> usize { self.values.len() }
+    fn n_rows(&self) -> usize { self.n as usize }
+    fn row_nnz(&self, row: usize) -> usize {
+        self.row_ptr[row + 1] - self.row_ptr[row]
+    }
+    fn row_entry(&self, row: usize, idx: usize) -> (usize, Val) {
+        let start = self.row_ptr[row];
+        (self.col_idx[start + idx] as usize, self.values[start + idx])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,5 +1563,179 @@ mod tests {
                 t_par_orig as f64 / t_par_rcm.max(1) as f64);
             println!();
         }
+    }
+
+    /// Dense output matrix for einsum benchmarks.
+    struct DenseOut {
+        data: Vec<Val>,
+        n: usize,
+    }
+
+    impl DenseOut {
+        fn new(n: usize) -> Self {
+            Self { data: vec![0; n * n], n }
+        }
+        fn clear(&mut self) {
+            self.data.fill(0);
+        }
+    }
+
+    impl NDIndex<Val> for DenseOut {
+        fn ndim(&self) -> usize { 2 }
+        fn dim(&self, _axis: usize) -> usize { self.n }
+        fn get(&self, ix: &[usize]) -> Val { self.data[ix[0] * self.n + ix[1]] }
+        fn set(&mut self, ix: &[usize], v: Val) {
+            self.data[ix[0] * self.n + ix[1]] = v;
+        }
+    }
+
+    #[test]
+    fn test_einsum_sparse_approaches_agree() {
+        use einsum_dyn::{einsum_binary, sparse::*};
+
+        // Build a small test matrix: 6-node graph
+        let a = CsrMatrix::from_edges_undirected(6, &[
+            (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (0, 3),
+        ]);
+        let n = a.n as usize;
+
+        // Reference: hand-written CSR matmul
+        let ref_result = a.matmul(&a);
+
+        // Approach 1: baseline einsum (dense loops + get_opt)
+        let mut out1 = DenseOut::new(n);
+        einsum_binary("ab,bc->ac", &a, &a, &mut out1).unwrap();
+
+        // Approach 2: sparse-driven with dense accumulator
+        let mut out2 = DenseOut::new(n);
+        einsum_sparse_driven("ab,bc->ac", &a, &a, &mut out2).unwrap();
+
+        // Approach 3: VM
+        let mut out3 = DenseOut::new(n);
+        einsum_vm_oneshot("ab,bc->ac", &[&a as &dyn NDIndex<Val>, &a], &mut out3).unwrap();
+
+        // Approach 4: sparse hash
+        let mut out4 = DenseOut::new(n);
+        einsum_sparse_hash("ab,bc->ac", &a, &a, &mut out4).unwrap();
+
+        // Verify all agree with reference
+        for i in 0..n {
+            for j in 0..n {
+                let expected = ref_result.get(i as NodeId, j as NodeId);
+                assert_eq!(out1.get(&[i, j]), expected, "baseline@({i},{j})");
+                assert_eq!(out2.get(&[i, j]), expected, "sparse-driven@({i},{j})");
+                assert_eq!(out3.get(&[i, j]), expected, "VM@({i},{j})");
+                assert_eq!(out4.get(&[i, j]), expected, "hash@({i},{j})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_einsum_vm_plan_display() {
+        use einsum_dyn::sparse::compile_vm;
+
+        let a = CsrMatrix::from_edges(100, &[(0, 1)]);
+        let program = compile_vm("ab,bc->ac", &[&a as &dyn NDIndex<Val>, &a]).unwrap();
+        let display = format!("{program}");
+        println!("{display}");
+        assert!(display.contains("SPARSE"), "should use sparse loops");
+    }
+
+    #[test]
+    #[cfg(feature = "long-tests")]
+    fn bench_einsum_sparse_approaches() {
+        use einsum_dyn::{einsum_binary, sparse::*};
+        use std::time::Instant;
+        use rand::prelude::StdRng;
+        use rand::SeedableRng;
+
+        let mut rng = StdRng::from_seed([42; 32]);
+
+        println!();
+        println!("╔══════════════════════════════════════════════════════════════════════╗");
+        println!("║           Sparse Einsum: Four Approaches Benchmark                  ║");
+        println!("╚══════════════════════════════════════════════════════════════════════╝");
+        println!();
+
+        // Test configurations: (label, matrix)
+        let configs: Vec<(&str, CsrMatrix)> = vec![
+            ("lattice 10³ full (26 e/n)", CsrMatrix::lattice(&[10, 10, 10], true)),
+            ("lattice 10³ thin (4 e/n)", CsrMatrix::lattice(&[10, 10, 10], true).thin(&mut rng, 4.0 / 26.0)),
+            ("lattice 15³ full (26 e/n)", CsrMatrix::lattice(&[15, 15, 15], true)),
+            ("lattice 15³ thin (4 e/n)", CsrMatrix::lattice(&[15, 15, 15], true).thin(&mut rng, 4.0 / 26.0)),
+            ("lattice 20³ thin (4 e/n)", CsrMatrix::lattice(&[20, 20, 20], true).thin(&mut rng, 4.0 / 26.0)),
+            ("random 1000n 5000e", CsrMatrix::random(&mut rng, 1000, 5000)),
+            ("random 2000n 10000e", CsrMatrix::random(&mut rng, 2000, 10000)),
+        ];
+
+        println!("{:<28} {:>6} {:>7} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "config", "n", "nnz",
+            "baseline", "sparse", "VM", "hash", "CSR matmul");
+        println!("{}", "─".repeat(105));
+
+        for (label, a) in &configs {
+            let n = a.n as usize;
+            let nnz = a.nnz();
+
+            // Skip baseline for large matrices (too slow)
+            let do_baseline = n <= 1500;
+
+            // Warmup
+            let mut out = DenseOut::new(n);
+
+            // Approach 1: baseline
+            let t_baseline = if do_baseline {
+                out.clear();
+                let t0 = Instant::now();
+                einsum_binary("ab,bc->ac", a, a, &mut out).unwrap();
+                t0.elapsed().as_micros()
+            } else {
+                0
+            };
+
+            // Approach 2: sparse-driven
+            out.clear();
+            let t0 = Instant::now();
+            einsum_sparse_driven("ab,bc->ac", a, a, &mut out).unwrap();
+            let t_sparse = t0.elapsed().as_micros();
+
+            // Approach 3: VM
+            out.clear();
+            let inputs: &[&dyn NDIndex<Val>] = &[a, a];
+            let program = compile_vm("ab,bc->ac", inputs).unwrap();
+            let t0 = Instant::now();
+            program.exec(inputs, &mut out);
+            let t_vm = t0.elapsed().as_micros();
+
+            // Approach 4: hash
+            out.clear();
+            let t0 = Instant::now();
+            einsum_sparse_hash("ab,bc->ac", a, a, &mut out).unwrap();
+            let t_hash = t0.elapsed().as_micros();
+
+            // Reference: CSR matmul
+            let t0 = Instant::now();
+            let _ref = a.matmul(a);
+            let t_csr = t0.elapsed().as_micros();
+
+            let baseline_str = if do_baseline {
+                format!("{:>9} µs", t_baseline)
+            } else {
+                "     skip".to_string()
+            };
+
+            println!("{:<28} {:>6} {:>7} {:>12} {:>9} µs {:>9} µs {:>9} µs {:>9} µs",
+                label, n, nnz,
+                baseline_str,
+                t_sparse, t_vm, t_hash, t_csr);
+        }
+
+        println!();
+        println!("Legend:");
+        println!("  baseline   = einsum_binary with get_opt (O(n³) dense loops)");
+        println!("  sparse     = einsum_sparse_driven (dense Vec accumulator per row)");
+        println!("  VM         = einsum_vm (compiled sparse/dense loop tree)");
+        println!("  hash       = einsum_sparse_hash (HashMap accumulator per row)");
+        println!("  CSR matmul = hand-written CsrMatrix::matmul (reference)");
     }
 }

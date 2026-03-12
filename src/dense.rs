@@ -1,4 +1,5 @@
 use crate::traits::{Attention, FromRng};
+use einsum_dyn::NDIndex;
 
 pub trait AttentionStrategy {}
 #[derive(Default)]
@@ -264,4 +265,11 @@ impl<S: AttentionStrategy + Default> FromRng for DenseTensorFRef<S> {
         }
         t
     }
+}
+
+impl<S: AttentionStrategy + Default> NDIndex<f32> for DenseTensorFRef<S> {
+    fn ndim(&self) -> usize { self.d.len() }
+    fn dim(&self, axis: usize) -> usize { self.d[axis] }
+    fn get(&self, ix: &[usize]) -> f32 { DenseTensorFRef::get(self, ix) }
+    fn set(&mut self, ix: &[usize], v: f32) { DenseTensorFRef::set(self, ix, v) }
 }

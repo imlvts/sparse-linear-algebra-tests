@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use std::num::Saturating;
 
 use crate::dense_btree::DenseBTreeList;
+use einsum_dyn::NDIndex;
 
 /// Node index type — u32 suffices for < 4 billion nodes and halves col_idx memory.
 pub type NodeId = u32;
@@ -807,6 +808,22 @@ impl CsrBTreeMatrix {
                 }
             }
             println!();
+        }
+    }
+}
+
+impl NDIndex<Val> for CsrBTreeMatrix {
+    fn ndim(&self) -> usize { 2 }
+    fn dim(&self, _axis: usize) -> usize { self.n as usize }
+    fn get(&self, ix: &[usize]) -> Val { CsrBTreeMatrix::get(self, ix[0] as NodeId, ix[1] as NodeId) }
+    fn set(&mut self, _ix: &[usize], _v: Val) { panic!("CsrBTreeMatrix is immutable after construction") }
+    fn get_opt(&self, ix: &[usize]) -> Option<Val> {
+        let r = ix[0] as NodeId;
+        let c = ix[1] as NodeId;
+        let start = self.col_trees.data_start(r as usize);
+        match self.col_trees.index(r as usize, &c) {
+            Ok(i) => Some(self.values[start + i]),
+            Err(_) => None,
         }
     }
 }
