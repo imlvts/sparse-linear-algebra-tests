@@ -1,14 +1,23 @@
 //! Runtime dynamic [Einstein summation](https://en.wikipedia.org/wiki/Einstein_notation)
 //! for arbitrary N-dimensional arrays.
 //!
-//! Provides four functions that interpret a numpy-style spec string at runtime:
+//! # Functions
 //!
 //! | Function | Inputs | Output |
 //! |---|---|---|
-//! | [`einsum_binary`] | two arrays | tensor (written to `&mut out`) |
-//! | [`einsum_unary`] | one array | tensor (written to `&mut out`) |
+//! | [`einsum_ary`] | N arrays (`&[&In]`) | tensor (`&mut Out`) |
+//! | [`einsum_binary`] | two arrays | tensor (`&mut Out`) |
+//! | [`einsum_unary`] | one array | tensor (`&mut Out`) |
 //! | [`einsum_binary_scalar`] | two arrays | scalar (returned) |
 //! | [`einsum_unary_scalar`] | one array | scalar (returned) |
+//!
+//! [`einsum_ary`] is the general-purpose entry point — it accepts any number
+//! of inputs and subsumes both [`einsum_binary`] and [`einsum_unary`]. The
+//! specialised functions remain for ergonomics and because they are ~1.5×
+//! faster (stack-only buffers vs heap `Vec`s for patterns/indices).
+//!
+//! For scalar output with `einsum_ary`, pass a 0-dimensional output tensor
+//! (`ndim() == 0`, single element at `&[]`).
 //!
 //! # Spec format
 //!
@@ -19,6 +28,7 @@
 //! - `"ab->ba"` — transpose (no contraction)
 //! - `"i,i->"` — dot product (scalar output, empty after `->`)
 //! - `"aa->"` — trace (scalar output)
+//! - `"ab,bc,cd->ad"` — 3-input chain contraction (N-ary)
 //!
 //! Indices present in inputs but absent from the output are contracted
 //! (summed over). All output indices must appear in at least one input.
@@ -28,7 +38,7 @@
 //! Any type can be used with these functions by implementing [`NDIndex`]:
 //!
 //! ```
-//! use einsum_dyn::{NDIndex, einsum_binary, einsum_unary, einsum_binary_scalar, einsum_unary_scalar};
+//! use einsum_dyn::{NDIndex, einsum_ary, einsum_binary, einsum_unary, einsum_binary_scalar, einsum_unary_scalar};
 //!
 //! struct MyTensor {
 //!     data: Vec<f64>,
@@ -88,6 +98,15 @@
 //! m.data = vec![1.0, 2.0, 3.0, 4.0];
 //! let tr: f64 = einsum_unary_scalar("aa->", &m).unwrap();
 //! assert_eq!(tr, 5.0);
+//!
+//! // N-ary: 3-input chain A(2×3) × B(3×2) × C(2×2) via einsum_ary
+//! let mut d = MyTensor::new(vec![2, 2]);
+//! einsum_ary("ab,bc,cd->ad", &[&a, &b, &c], &mut d).unwrap();
+//!
+//! // N-ary with scalar output (0-dim tensor)
+//! let mut scalar = MyTensor::new(vec![]);
+//! einsum_ary("i,i->", &[&x, &y], &mut scalar).unwrap();
+//! assert_eq!(scalar.data, vec![32.0]);
 //! ```
 //!
 //! # Feature flags
@@ -527,6 +546,12 @@ pub(crate) fn validate_output<T, Arr: NDIndex<T>>(
 /// Generalises [`einsum_binary`] and [`einsum_unary`] to an arbitrary number
 /// of inputs. The spec must contain exactly `inputs.len()` comma-separated
 /// input index groups.
+///
+/// For scalar output, pass a 0-dimensional output tensor (`ndim() == 0`,
+/// one element at index `&[]`) and use an empty output spec (e.g. `"i,i->"`).
+///
+/// The specialised binary/unary functions are ~1.5× faster due to stack-only
+/// buffers; prefer them for the 1- and 2-input cases on hot paths.
 ///
 /// ```
 /// # use einsum_dyn::{NDIndex, einsum_ary};
