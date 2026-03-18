@@ -1612,7 +1612,7 @@ mod tests {
 
         // Approach 3: VM
         let mut out3 = DenseOut::new(n);
-        einsum_vm_oneshot("ab,bc->ac", &[&a as &dyn NDIndex<Val>, &a], &mut out3).unwrap();
+        einsum_vm_oneshot("ab,bc->ac", &[&a, &a], &mut [&mut out3]).unwrap();
 
         // Approach 4: sparse hash
         let mut out4 = DenseOut::new(n);

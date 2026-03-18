@@ -84,7 +84,7 @@ where
 
     let a_slots = &spec.inputs[0];
     let b_slots = &spec.inputs[1];
-    let out_slots = &spec.output;
+    let out_slots = &spec.output();
 
     assert_eq!(a_slots.len(), 2, "sparse-driven requires 2D inputs");
     assert_eq!(b_slots.len(), 2, "sparse-driven requires 2D inputs");
@@ -194,8 +194,8 @@ pub struct VmProgram {
     pub ops: Vec<VmOp>,
     /// Input slot patterns: input_patterns[i] = list of slot indices for input i.
     input_patterns: Vec<Vec<u8>>,
-    /// Output slot pattern.
-    output_pattern: Vec<u8>,
+    /// Output slot patterns: one per output in the spec.
+    output_patterns: Vec<Vec<u8>>,
     /// For each input: `Some(loop_index)` of the SparseRowLoop that fully covers
     /// it (both axes iterated by that one loop), or `None` if `get_opt` is needed.
     /// When `Some`, `MulAcc` reads the cached sparse value instead of calling `get_opt`.
@@ -277,10 +277,12 @@ pub fn compile_vm<T: Copy>(
             }
         }
     }
-    for &s in &spec.output {
-        if !seen[s as usize] {
-            seen[s as usize] = true;
-            all_slots.push(s);
+    for out in &spec.outputs {
+        for &s in out {
+            if !seen[s as usize] {
+                seen[s as usize] = true;
+                all_slots.push(s);
+            }
         }
     }
 
@@ -383,26 +385,29 @@ pub fn compile_vm<T: Copy>(
     //   acc_slot=c, flush_loop_idx=0 (the 'a' loop).
     //   Bytecode: FOR a | AccStart | FOR b(sparse) | FOR c(sparse) | MulAcc |
     //             LoopEnd(c) | LoopEnd(b) | AccFlush | LoopEnd(a)
+    // Accumulator optimization: only for single-output specs.
+    // With multi-output, different outputs may have different index layouts,
+    // so the dense accumulator trick doesn't generalise cleanly.
+    let all_output_slots = spec.all_output_slots();
     let mut acc_info: Option<(u8, u8, usize, usize)> = None; // (acc_slot, acc_out_pos, acc_dim, flush_loop_idx)
-    if let Some(last_op) = loop_order.last() {
-        let inner_slot = match last_op {
-            VmOp::DenseLoop { slot, .. } => *slot,
-            VmOp::SparseRowLoop { col_slot, .. } => *col_slot,
-            _ => unreachable!(),
-        };
-        if let Some(pos) = spec.output.iter().position(|&s| s == inner_slot) {
-            // Find innermost loop whose slot is in the output (excluding inner_slot).
-            // This is the loop after which we flush — ensures acc covers exactly
-            // one "row" of the output.
-            for (i, op) in loop_order.iter().enumerate().rev() {
-                let s = match op {
-                    VmOp::DenseLoop { slot, .. } => *slot,
-                    VmOp::SparseRowLoop { col_slot, .. } => *col_slot,
-                    _ => unreachable!(),
-                };
-                if s != inner_slot && spec.output.contains(&s) {
-                    acc_info = Some((inner_slot, pos as u8, dims[inner_slot as usize], i));
-                    break;
+    if spec.outputs.len() == 1 {
+        if let Some(last_op) = loop_order.last() {
+            let inner_slot = match last_op {
+                VmOp::DenseLoop { slot, .. } => *slot,
+                VmOp::SparseRowLoop { col_slot, .. } => *col_slot,
+                _ => unreachable!(),
+            };
+            if let Some(pos) = spec.output().iter().position(|&s| s == inner_slot) {
+                for (i, op) in loop_order.iter().enumerate().rev() {
+                    let s = match op {
+                        VmOp::DenseLoop { slot, .. } => *slot,
+                        VmOp::SparseRowLoop { col_slot, .. } => *col_slot,
+                        _ => unreachable!(),
+                    };
+                    if s != inner_slot && all_output_slots.contains(&s) {
+                        acc_info = Some((inner_slot, pos as u8, dims[inner_slot as usize], i));
+                        break;
+                    }
                 }
             }
         }
@@ -464,7 +469,7 @@ pub fn compile_vm<T: Copy>(
     Ok(VmProgram {
         ops,
         input_patterns: spec.inputs.clone(),
-        output_pattern: spec.output.clone(),
+        output_patterns: spec.outputs.clone(),
         sparse_value_source,
     })
 }
@@ -493,7 +498,7 @@ impl VmProgram {
     pub fn exec<T>(
         &self,
         inputs: &[&dyn NDIndex<T>],
-        out: &mut dyn NDIndex<T>,
+        outs: &mut [&mut dyn NDIndex<T>],
     ) where
         T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
     {
@@ -501,7 +506,7 @@ impl VmProgram {
         let mut buf = [0usize; 26];
         let mut sparse_vals: Vec<T> = vec![T::default(); inputs.len()];
         let mut acc_state: Option<AccState<T>> = None;
-        self.exec_at(0, &mut vals, &mut buf, &mut sparse_vals, &mut acc_state, inputs, out);
+        self.exec_at(0, &mut vals, &mut buf, &mut sparse_vals, &mut acc_state, inputs, outs);
     }
 
     /// Execute bytecode starting at `pc`. Returns the pc after the
@@ -514,7 +519,7 @@ impl VmProgram {
         sparse_vals: &mut [T],
         acc_state: &mut Option<AccState<T>>,
         inputs: &[&dyn NDIndex<T>],
-        out: &mut dyn NDIndex<T>,
+        outs: &mut [&mut dyn NDIndex<T>],
     ) -> usize
     where
         T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
@@ -527,12 +532,12 @@ impl VmProgram {
                     if *fused {
                         for v in 0..*dim {
                             vals[s] = v;
-                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, out);
+                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, outs);
                         }
                     } else {
                         for v in 0..*dim {
                             vals[s] = v;
-                            self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
+                            self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, outs);
                         }
                     }
                     pc = *end_pc;
@@ -553,14 +558,14 @@ impl VmProgram {
                             let (col, val) = input.sparse_row_entry(row, ei);
                             vals[cs] = col;
                             sparse_vals[*input_idx] = val;
-                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, out);
+                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, outs);
                         }
                     } else {
                         for ei in 0..nnz {
                             let (col, val) = input.sparse_row_entry(row, ei);
                             vals[cs] = col;
                             sparse_vals[*input_idx] = val;
-                            self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, out);
+                            self.exec_at(pc + 1, vals, buf, sparse_vals, acc_state, inputs, outs);
                         }
                     }
                     pc = *end_pc;
@@ -578,14 +583,16 @@ impl VmProgram {
                     pc += 1;
                 }
                 VmOp::AccFlush => {
+                    // AccFlush only emitted for single-output specs
                     if let Some(st) = acc_state {
-                        let len = self.output_pattern.len();
+                        let pattern = &self.output_patterns[0];
+                        let len = pattern.len();
                         for &j in st.nz_cols.iter() {
-                            for (i, &s) in self.output_pattern.iter().enumerate() {
+                            for (i, &s) in pattern.iter().enumerate() {
                                 buf[i] = vals[s as usize];
                             }
                             buf[st.acc_out_pos as usize] = j;
-                            out.set(&buf[..len], st.acc[j]);
+                            outs[0].set(&buf[..len], st.acc[j]);
                             st.acc[j] = T::default();
                         }
                         st.nz_cols.clear();
@@ -593,7 +600,7 @@ impl VmProgram {
                     pc += 1;
                 }
                 VmOp::MulAcc => {
-                    self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, out);
+                    self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, outs);
                     pc += 1;
                 }
             }
@@ -602,7 +609,7 @@ impl VmProgram {
     }
 
     /// Compute one multiply-accumulate step: read inputs, multiply, write to
-    /// accumulator or output.
+    /// accumulator or output(s).
     #[inline]
     fn mul_acc<T>(
         &self,
@@ -611,7 +618,7 @@ impl VmProgram {
         sparse_vals: &[T],
         acc_state: &mut Option<AccState<T>>,
         inputs: &[&dyn NDIndex<T>],
-        out: &mut dyn NDIndex<T>,
+        outs: &mut [&mut dyn NDIndex<T>],
     ) where
         T: Default + Copy + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
     {
@@ -638,18 +645,22 @@ impl VmProgram {
         }
         if let Some(p) = product {
             if let Some(st) = acc_state {
+                // Single-output accumulator path
                 let idx = vals[st.acc_slot as usize];
                 if st.acc[idx] == T::default() {
                     st.nz_cols.push(idx);
                 }
                 st.acc[idx] += p;
             } else {
-                let len = self.output_pattern.len();
-                for (i, &s) in self.output_pattern.iter().enumerate() {
-                    buf[i] = vals[s as usize];
+                // Write to all outputs
+                for (oi, pattern) in self.output_patterns.iter().enumerate() {
+                    let len = pattern.len();
+                    for (i, &s) in pattern.iter().enumerate() {
+                        buf[i] = vals[s as usize];
+                    }
+                    let cur = outs[oi].get(&buf[..len]);
+                    outs[oi].set(&buf[..len], cur + p);
                 }
-                let cur = out.get(&buf[..len]);
-                out.set(&buf[..len], cur + p);
             }
         }
     }
@@ -657,14 +668,42 @@ impl VmProgram {
 
 /// Convenience: compile and execute in one call.
 ///
-/// Accepts any number of inputs of any dimensionality.
-pub fn einsum_vm_oneshot<T: Copy + Default + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq>(
+/// Accepts any number of inputs and outputs of any dimensionality.
+/// All inputs must be the same concrete type; for mixed types use
+/// [`einsum_vm_oneshot_dyn`].
+///
+/// Multiple outputs are supported: `"ab,bc->ac,ca"` writes to two output
+/// tensors simultaneously from a single loop nest.
+pub fn einsum_vm_oneshot<T, In, Out>(
+    spec_str: &str,
+    inputs: &[&In],
+    outs: &mut [&mut Out],
+) -> Result<(), InvalidSpec>
+where
+    T: Copy + Default + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
+    In: NDIndex<T>,
+    Out: NDIndex<T>,
+{
+    let dyn_inputs: Vec<&dyn NDIndex<T>> = inputs.iter().map(|&x| x as &dyn NDIndex<T>).collect();
+    let mut dyn_outs: Vec<&mut dyn NDIndex<T>> = outs.iter_mut().map(|o| {
+        let r: &mut Out = *o;
+        r as &mut dyn NDIndex<T>
+    }).collect();
+    einsum_vm_oneshot_dyn(spec_str, &dyn_inputs, &mut dyn_outs)
+}
+
+/// Like [`einsum_vm_oneshot`] but accepts trait-object inputs, allowing
+/// mixed concrete types (e.g. one sparse and one dense input).
+pub fn einsum_vm_oneshot_dyn<T>(
     spec_str: &str,
     inputs: &[&dyn NDIndex<T>],
-    out: &mut dyn NDIndex<T>,
-) -> Result<(), InvalidSpec> {
+    outs: &mut [&mut dyn NDIndex<T>],
+) -> Result<(), InvalidSpec>
+where
+    T: Copy + Default + Add<Output = T> + AddAssign + Mul<Output = T> + PartialEq,
+{
     let program = compile_vm(spec_str, inputs)?;
-    program.exec(inputs, out);
+    program.exec(inputs, outs);
     Ok(())
 }
 
@@ -696,7 +735,7 @@ where
 
     let a_slots = &spec.inputs[0];
     let b_slots = &spec.inputs[1];
-    let out_slots = &spec.output;
+    let out_slots = &spec.output();
 
     assert_eq!(a_slots.len(), 2, "sparse-hash requires 2D inputs");
     assert_eq!(b_slots.len(), 2, "sparse-hash requires 2D inputs");
@@ -761,11 +800,11 @@ impl std::fmt::Display for VmProgram {
         )?;
         writeln!(
             f,
-            "  output: {}",
-            self.output_pattern
+            "  outputs: {:?}",
+            self.output_patterns
                 .iter()
-                .map(|&s| (s + b'a') as char)
-                .collect::<String>()
+                .map(|p| p.iter().map(|&s| (s + b'a') as char).collect::<String>())
+                .collect::<Vec<_>>()
         )?;
         writeln!(f, "  plan:")?;
         let mut indent = 2usize;
@@ -1029,7 +1068,7 @@ mod tests {
         let b = SparseMat::from_triplets(4, &[(1, 0, 5), (2, 0, 6), (3, 1, 7)]);
         let mut out = DenseMat::new(4, 4);
 
-        einsum_vm_oneshot("ab,bc->ac", &[&a as &dyn NDIndex<u32>, &b], &mut out).unwrap();
+        einsum_vm_oneshot("ab,bc->ac", &[&a, &b], &mut [&mut out]).unwrap();
 
         let expected = naive_matmul(&a, &b);
         for i in 0..4 {
@@ -1090,7 +1129,7 @@ mod tests {
         einsum_sparse_driven("ab,bc->ac", &a, &b, &mut out2).unwrap();
 
         let mut out3 = DenseMat::new(4, 4);
-        einsum_vm_oneshot("ab,bc->ac", &[&a as &dyn NDIndex<u32>, &b], &mut out3).unwrap();
+        einsum_vm_oneshot("ab,bc->ac", &[&a, &b], &mut [&mut out3]).unwrap();
 
         let mut out4 = DenseMat::new(4, 4);
         einsum_sparse_hash("ab,bc->ac", &a, &b, &mut out4).unwrap();
@@ -1177,8 +1216,8 @@ mod tests {
         let mut out = DenseTensor::new(vec![2, 3, 5]);
         einsum_vm_oneshot(
             "abc,cd->abd",
-            &[&a as &dyn NDIndex<u32>, &b as &dyn NDIndex<u32>],
-            &mut out,
+            &[&a, &b],
+            &mut [&mut out],
         ).unwrap();
 
         // Verify against naive computation
@@ -1211,10 +1250,10 @@ mod tests {
         }
 
         let mut out = DenseMat::new(3, 3);
-        einsum_vm_oneshot(
+        einsum_vm_oneshot_dyn(
             "ab,bc->ac",
             &[&a as &dyn NDIndex<u32>, &b as &dyn NDIndex<u32>],
-            &mut out,
+            &mut [&mut out as &mut dyn NDIndex<u32>],
         ).unwrap();
 
         // Verify: row 0 of A has only (1, 2), row 1 has only (2, 3)
@@ -1248,8 +1287,8 @@ mod tests {
         let mut out = DenseTensor::new(vec![ba, h, q, k]);
         einsum_vm_oneshot(
             "bhqd,bhkd->bhqk",
-            &[&qm as &dyn NDIndex<u32>, &km as &dyn NDIndex<u32>],
-            &mut out,
+            &[&qm, &km],
+            &mut [&mut out],
         ).unwrap();
 
         for qi in 0..q {
@@ -1273,6 +1312,182 @@ mod tests {
                 row_ptr: self.row_ptr.clone(),
                 col_idx: self.col_idx.clone(),
                 values: self.values.clone(),
+            }
+        }
+    }
+
+    /// 0-dim scalar output tensor for VM scalar tests.
+    struct ScalarOut {
+        val: u32,
+    }
+
+    impl ScalarOut {
+        fn new() -> Self { Self { val: 0 } }
+    }
+
+    impl NDIndex<u32> for ScalarOut {
+        fn ndim(&self) -> usize { 0 }
+        fn dim(&self, _axis: usize) -> usize { panic!("0-dim has no axes") }
+        fn get(&self, _ix: &[usize]) -> u32 { self.val }
+        fn set(&mut self, _ix: &[usize], v: u32) { self.val = v; }
+    }
+
+    #[test]
+    fn test_vm_scalar_dot_sparse() {
+        // "i,i->" dot product with sparse inputs
+        // a = [0, 2, 0, 3], b = [0, 5, 7, 0]
+        // dot = 0 + 2*5 + 0 + 0 = 10
+        let a = SparseMat::from_triplets(1, &[(0, 1, 2), (0, 3, 3)]);
+        let b = SparseMat::from_triplets(1, &[(0, 1, 5), (0, 2, 7)]);
+
+        // For dot product on 1D vectors stored as 1-row matrices,
+        // use spec "ab,ab->" (Frobenius inner product) since SparseMat is 2D
+        let mut out = ScalarOut::new();
+        einsum_vm_oneshot("ab,ab->", &[&a, &b], &mut [&mut out]).unwrap();
+
+        // a[0,1]*b[0,1] + a[0,3]*b[0,3] = 2*5 + 0 = 10
+        assert_eq!(out.val, 10);
+    }
+
+    #[test]
+    fn test_vm_scalar_trace_sparse() {
+        // "aa->" trace of a sparse matrix
+        // Only diagonal entries matter: (0,0)=1, (1,1)=5, (2,2)=9
+        let m = SparseMat::from_triplets(3, &[
+            (0, 0, 1), (0, 2, 2),
+            (1, 1, 5), (1, 2, 3),
+            (2, 2, 9),
+        ]);
+
+        let mut out = ScalarOut::new();
+        einsum_vm_oneshot("aa->", &[&m], &mut [&mut out]).unwrap();
+
+        assert_eq!(out.val, 15); // 1 + 5 + 9
+    }
+
+    #[test]
+    fn test_vm_scalar_frobenius_sparse() {
+        // "ab,ab->" Frobenius inner product (sum of element-wise products)
+        let a = SparseMat::from_triplets(3, &[
+            (0, 1, 2), (1, 0, 3), (2, 2, 4),
+        ]);
+        let b = SparseMat::from_triplets(3, &[
+            (0, 1, 5), (1, 0, 7), (1, 1, 99), (2, 2, 2),
+        ]);
+
+        let mut out = ScalarOut::new();
+        einsum_vm_oneshot("ab,ab->", &[&a, &b], &mut [&mut out]).unwrap();
+
+        // overlapping entries: (0,1): 2*5=10, (1,0): 3*7=21, (2,2): 4*2=8
+        assert_eq!(out.val, 39); // 10 + 21 + 8
+    }
+
+    #[test]
+    fn test_vm_scalar_dense_dot() {
+        // "i,i->" with dense 1D inputs
+        let mut a = DenseTensor::new(vec![4]);
+        let mut b = DenseTensor::new(vec![4]);
+        for i in 0..4 {
+            a.set(&[i], (i + 1) as u32);       // [1, 2, 3, 4]
+            b.set(&[i], (i + 5) as u32);       // [5, 6, 7, 8]
+        }
+
+        let mut out = ScalarOut::new();
+        einsum_vm_oneshot("i,i->", &[&a, &b], &mut [&mut out]).unwrap();
+
+        // 1*5 + 2*6 + 3*7 + 4*8 = 5 + 12 + 21 + 32 = 70
+        assert_eq!(out.val, 70);
+    }
+
+    #[test]
+    fn test_vm_scalar_three_input() {
+        // "i,i,i->" element-wise triple product summed to scalar
+        let mut a = DenseTensor::new(vec![3]);
+        let mut b = DenseTensor::new(vec![3]);
+        let mut c = DenseTensor::new(vec![3]);
+        for i in 0..3 {
+            a.set(&[i], (i + 1) as u32);       // [1, 2, 3]
+            b.set(&[i], (i + 4) as u32);       // [4, 5, 6]
+            c.set(&[i], (i + 7) as u32);       // [7, 8, 9]
+        }
+
+        let mut out = ScalarOut::new();
+        einsum_vm_oneshot("i,i,i->", &[&a, &b, &c], &mut [&mut out]).unwrap();
+
+        // 1*4*7 + 2*5*8 + 3*6*9 = 28 + 80 + 162 = 270
+        assert_eq!(out.val, 270);
+    }
+
+    // --- Multi-output tests ---
+
+    #[test]
+    fn test_vm_multi_output_matmul_and_transpose() {
+        // "ab,bc->ac,ca": matmul result written to both C and C^T simultaneously
+        let a = SparseMat::from_triplets(3, &[(0, 1, 2), (1, 2, 3), (2, 0, 1)]);
+        let b = SparseMat::from_triplets(3, &[(0, 1, 4), (1, 0, 5), (2, 2, 6)]);
+
+        let mut out_ac = DenseMat::new(3, 3);
+        let mut out_ca = DenseMat::new(3, 3);
+        einsum_vm_oneshot("ab,bc->ac,ca", &[&a, &b], &mut [&mut out_ac, &mut out_ca]).unwrap();
+
+        // Verify against naive matmul
+        let expected = naive_matmul(&a, &b);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(out_ac.get(&[i, j]), expected[i][j], "ac@({i},{j})");
+                assert_eq!(out_ca.get(&[j, i]), expected[i][j], "ca@({j},{i})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_vm_multi_output_dense() {
+        // "ab,bc->ac,ca" with dense inputs
+        let mut a = DenseTensor::new(vec![3, 3]);
+        let mut b = DenseTensor::new(vec![3, 3]);
+        for i in 0..3 {
+            for j in 0..3 {
+                a.set(&[i, j], (i * 3 + j + 1) as u32);
+                b.set(&[i, j], (i * 3 + j + 10) as u32);
+            }
+        }
+
+        let mut out_ac = DenseTensor::new(vec![3, 3]);
+        let mut out_ca = DenseTensor::new(vec![3, 3]);
+        einsum_vm_oneshot("ab,bc->ac,ca", &[&a, &b], &mut [&mut out_ac, &mut out_ca]).unwrap();
+
+        // Verify C[i,j] = sum_k A[i,k]*B[k,j]
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut expected = 0u32;
+                for k in 0..3 {
+                    expected += a.get(&[i, k]) * b.get(&[k, j]);
+                }
+                assert_eq!(out_ac.get(&[i, j]), expected, "ac@({i},{j})");
+                assert_eq!(out_ca.get(&[j, i]), expected, "ca@({j},{i})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_vm_multi_output_matmul_and_scalar() {
+        // "ab,bc->ac," : matmul + scalar (Frobenius-like total sum)
+        // Wait — we need different contracted indices for the scalar.
+        // Actually "ab,ba->,ab" would be: scalar = sum_ab A[a,b]*B[b,a],
+        // and output ab = A[a,b]*B[b,a] (element-wise, no contraction for ab output)
+        // Let's test a simpler case: "ab,bc->ac,ac" (same output written twice)
+        let a = SparseMat::from_triplets(3, &[(0, 1, 2), (1, 2, 3)]);
+        let b = SparseMat::from_triplets(3, &[(1, 0, 5), (2, 2, 6)]);
+
+        let mut out1 = DenseMat::new(3, 3);
+        let mut out2 = DenseMat::new(3, 3);
+        einsum_vm_oneshot("ab,bc->ac,ac", &[&a, &b], &mut [&mut out1, &mut out2]).unwrap();
+
+        let expected = naive_matmul(&a, &b);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(out1.get(&[i, j]), expected[i][j], "out1@({i},{j})");
+                assert_eq!(out2.get(&[i, j]), expected[i][j], "out2@({i},{j})");
             }
         }
     }

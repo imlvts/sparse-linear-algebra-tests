@@ -205,9 +205,34 @@ impl std::error::Error for InvalidSpec {}
 
 /// Parsed einsum specification. All index chars are stored as slot indices
 /// (`b'a'` → 0, `b'b'` → 1, ..., `b'z'` → 25).
+///
+/// The RHS of the spec may contain multiple comma-separated output groups
+/// (e.g. `"ab,bc->ac,ca"`). Single-output functions check `outputs.len() == 1`.
 pub(crate) struct Spec {
     inputs: Vec<Vec<u8>>,
-    output: Vec<u8>,
+    outputs: Vec<Vec<u8>>,
+}
+
+impl Spec {
+    /// Convenience: returns the first (and usually only) output pattern.
+    pub(crate) fn output(&self) -> &[u8] {
+        &self.outputs[0]
+    }
+
+    /// All unique output slots across all outputs.
+    pub(crate) fn all_output_slots(&self) -> Vec<u8> {
+        let mut seen = [false; 26];
+        let mut slots = Vec::new();
+        for out in &self.outputs {
+            for &s in out {
+                if !seen[s as usize] {
+                    seen[s as usize] = true;
+                    slots.push(s);
+                }
+            }
+        }
+        slots
+    }
 }
 
 pub(crate) fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, InvalidSpec> {
@@ -242,12 +267,21 @@ pub(crate) fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, Inv
         }
     }
 
-    let mut output: Vec<u8> = Vec::new();
-    for ch in rhs.bytes() {
-        if !ch.is_ascii_lowercase() {
-            return Err(InvalidSpec::InvalidIndex { ch: ch as char });
+    let mut outputs: Vec<Vec<u8>> = Vec::new();
+    if rhs.is_empty() {
+        // Scalar output: single empty group
+        outputs.push(Vec::new());
+    } else {
+        for part in rhs.split(',') {
+            let mut slots = Vec::new();
+            for ch in part.bytes() {
+                if !ch.is_ascii_lowercase() {
+                    return Err(InvalidSpec::InvalidIndex { ch: ch as char });
+                }
+                slots.push(ch - b'a');
+            }
+            outputs.push(slots);
         }
-        output.push(ch - b'a');
     }
 
     // Validate: every output index must appear in at least one input
@@ -257,13 +291,15 @@ pub(crate) fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, Inv
             seen[s as usize] = true;
         }
     }
-    for &s in &output {
-        if !seen[s as usize] {
-            return Err(InvalidSpec::UnboundOutputIndex { index: slot_to_char(s) });
+    for out in &outputs {
+        for &s in out {
+            if !seen[s as usize] {
+                return Err(InvalidSpec::UnboundOutputIndex { index: slot_to_char(s) });
+            }
         }
     }
 
-    Ok(Spec { inputs, output })
+    Ok(Spec { inputs, outputs })
 }
 
 /// Validates that array dimensions match the spec. Returns dims as a `[usize; 26]`
@@ -468,13 +504,13 @@ pub(crate) fn validate_output<T, Arr: NDIndex<T>>(
     dims: &[usize; 26],
     out: &Arr,
 ) -> Result<(), InvalidSpec> {
-    if out.ndim() != spec.output.len() {
+    if out.ndim() != spec.output().len() {
         return Err(InvalidSpec::OutputNdimMismatch {
             array_ndim: out.ndim(),
-            spec_ndim: spec.output.len(),
+            spec_ndim: spec.output().len(),
         });
     }
-    for (pos, &s) in spec.output.iter().enumerate() {
+    for (pos, &s) in spec.output().iter().enumerate() {
         if out.dim(pos) != dims[s as usize] {
             return Err(InvalidSpec::OutputDimMismatch {
                 axis: pos,
@@ -483,6 +519,103 @@ pub(crate) fn validate_output<T, Arr: NDIndex<T>>(
             });
         }
     }
+    Ok(())
+}
+
+/// `einsum_ary(spec, inputs, out)` — N-ary einsum with tensor output.
+///
+/// Generalises [`einsum_binary`] and [`einsum_unary`] to an arbitrary number
+/// of inputs. The spec must contain exactly `inputs.len()` comma-separated
+/// input index groups.
+///
+/// ```
+/// # use einsum_dyn::{NDIndex, einsum_ary};
+/// # struct T { m: Vec<f32>, d: Vec<usize> }
+/// # impl T { fn new(d: Vec<usize>) -> Self { let n = d.iter().product(); Self { m: vec![0.0; n], d } } fn li(&self, ix: &[usize]) -> usize { let mut i=0; let mut s=1; for (&k,&d) in ix.iter().rev().zip(self.d.iter().rev()) { i+=k*s; s*=d; } i } }
+/// # impl NDIndex<f32> for T { fn ndim(&self)->usize{self.d.len()} fn dim(&self,a:usize)->usize{self.d[a]} fn get(&self,ix:&[usize])->f32{self.m[self.li(ix)]} fn set(&mut self,ix:&[usize],v:f32){let i=self.li(ix);self.m[i]=v;} }
+/// let mut a = T::new(vec![2, 3]);
+/// a.m = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+/// let mut b = T::new(vec![3, 2]);
+/// b.m = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+/// let mut c = T::new(vec![2, 2]);
+/// einsum_ary("ab,bc->ac", &[&a, &b], &mut c).unwrap();
+/// assert_eq!(c.m, vec![58.0, 64.0, 139.0, 154.0]);
+/// ```
+pub fn einsum_ary<T, In, Out>(spec: &str, inputs: &[&In], out: &mut Out) -> Result<(), InvalidSpec>
+where
+    T: Default + Copy + AddAssign + Mul<Output = T>,
+    In: NDIndex<T>,
+    Out: NDIndex<T>,
+{
+    let spec = parse_spec(spec, inputs.len())?;
+    let dims = validate_dims(&spec, inputs)?;
+    validate_output(&spec, &dims, out)?;
+
+    let free_slots = SlotList::from_slots(&spec.output());
+    let all = all_slots_ordered(&spec);
+    let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
+
+    let pats: Vec<Pattern> = spec.inputs.iter().map(|inp| Pattern::from_slots(inp)).collect();
+    let pat_out = Pattern::from_slots(&spec.output());
+
+    let n = inputs.len();
+    let mut vals = [0usize; 26];
+    let mut bufs: Vec<Idx> = (0..n).map(|_| Idx::ZERO).collect();
+    let mut buf_out = Idx::ZERO;
+
+    if contracted_slots.len == 0 {
+        // No contraction — direct assignment
+        loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |vals| {
+            for i in 0..n {
+                pats[i].gather(vals, &mut bufs[i]);
+            }
+            // Multiply all input values; if any is sparse-absent, result is zero
+            let first = match inputs[0].get_opt(bufs[0].as_slice()) {
+                Some(v) => v,
+                None => { pat_out.gather(vals, &mut buf_out); out.set(buf_out.as_slice(), Default::default()); return; }
+            };
+            let mut product = first;
+            for i in 1..n {
+                match inputs[i].get_opt(bufs[i].as_slice()) {
+                    Some(v) => product = product * v,
+                    None => { pat_out.gather(vals, &mut buf_out); out.set(buf_out.as_slice(), Default::default()); return; }
+                }
+            }
+            pat_out.gather(vals, &mut buf_out);
+            out.set(buf_out.as_slice(), product);
+        });
+    } else {
+        // With contraction — accumulate per output element
+        loop_nest(free_slots.as_slice(), &dims, &mut vals, &mut |free_vals| {
+            let mut acc: T = Default::default();
+            let mut inner_vals = *free_vals;
+            loop_nest(
+                contracted_slots.as_slice(),
+                &dims,
+                &mut inner_vals,
+                &mut |vals| {
+                    for i in 0..n {
+                        pats[i].gather(vals, &mut bufs[i]);
+                    }
+                    let first = match inputs[0].get_opt(bufs[0].as_slice()) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    let mut product = first;
+                    for i in 1..n {
+                        match inputs[i].get_opt(bufs[i].as_slice()) {
+                            Some(v) => product = product * v,
+                            None => return,
+                        }
+                    }
+                    acc += product;
+                },
+            );
+            pat_out.gather(free_vals, &mut buf_out);
+            out.set(buf_out.as_slice(), acc);
+        });
+    }
+
     Ok(())
 }
 
@@ -502,13 +635,13 @@ where
     let dims = validate_dims(&spec, &[a, b])?;
     validate_output(&spec, &dims, out)?;
 
-    let free_slots = SlotList::from_slots(&spec.output);
+    let free_slots = SlotList::from_slots(&spec.output());
     let all = all_slots_ordered(&spec);
     let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
 
     let pat_a = Pattern::from_slots(&spec.inputs[0]);
     let pat_b = Pattern::from_slots(&spec.inputs[1]);
-    let pat_out = Pattern::from_slots(&spec.output);
+    let pat_out = Pattern::from_slots(&spec.output());
 
     let mut vals = [0usize; 26];
     let mut buf_a = Idx::ZERO;
@@ -567,12 +700,12 @@ where
     let dims = validate_dims(&spec, &[a])?;
     validate_output(&spec, &dims, out)?;
 
-    let free_slots = SlotList::from_slots(&spec.output);
+    let free_slots = SlotList::from_slots(&spec.output());
     let all = all_slots_ordered(&spec);
     let contracted_slots = SlotList::filtered_complement(all.as_slice(), &free_slots);
 
     let pat_a = Pattern::from_slots(&spec.inputs[0]);
-    let pat_out = Pattern::from_slots(&spec.output);
+    let pat_out = Pattern::from_slots(&spec.output());
     let mut vals = [0usize; 26];
     let mut buf_a = Idx::ZERO;
     let mut buf_out = Idx::ZERO;
@@ -618,7 +751,7 @@ where
     let spec = parse_spec(spec, 2)?;
     let dims = validate_dims(&spec, &[a, b])?;
 
-    if !spec.output.is_empty() {
+    if !spec.output().is_empty() {
         return Err(InvalidSpec::NonEmptyScalarOutput);
     }
 
@@ -654,7 +787,7 @@ where
     let spec = parse_spec(spec, 1)?;
     let dims = validate_dims(&spec, &[a])?;
 
-    if !spec.output.is_empty() {
+    if !spec.output().is_empty() {
         return Err(InvalidSpec::NonEmptyScalarOutput);
     }
 
@@ -1007,6 +1140,139 @@ mod tests {
 
         let mut out = Tensor::new(vec![2]);
         einsum_unary("ab->a", &a, &mut out).unwrap();
+
+        assert_eq!(out.get(&[0]), 6.0);
+        assert_eq!(out.get(&[1]), 15.0);
+    }
+
+    // --- einsum_ary tests ---
+
+    #[test]
+    fn test_ary_matmul_as_binary() {
+        // einsum_ary with 2 inputs should match einsum_binary
+        let mut a = Tensor::new(vec![2, 3]);
+        let mut b = Tensor::new(vec![3, 2]);
+        set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        set_matrix(&mut b, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+
+        let mut c = Tensor::new(vec![2, 2]);
+        einsum_ary("ab,bc->ac", &[&a, &b], &mut c).unwrap();
+
+        assert_eq!(c.get(&[0, 0]), 58.0);
+        assert_eq!(c.get(&[0, 1]), 64.0);
+        assert_eq!(c.get(&[1, 0]), 139.0);
+        assert_eq!(c.get(&[1, 1]), 154.0);
+    }
+
+    #[test]
+    fn test_ary_transpose_as_unary() {
+        // einsum_ary with 1 input should match einsum_unary
+        let mut a = Tensor::new(vec![2, 3]);
+        set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let mut t = Tensor::new(vec![3, 2]);
+        einsum_ary("ab->ba", &[&a], &mut t).unwrap();
+
+        assert_eq!(t.get(&[0, 0]), 1.0);
+        assert_eq!(t.get(&[0, 1]), 4.0);
+        assert_eq!(t.get(&[1, 0]), 2.0);
+        assert_eq!(t.get(&[2, 1]), 6.0);
+    }
+
+    #[test]
+    fn test_ary_three_input_chain() {
+        // A(2×3) × B(3×4) × C(4×2) -> D(2×2)
+        // spec: "ab,bc,cd->ad" contracts b and c
+        let mut a = Tensor::new(vec![2, 3]);
+        set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut b = Tensor::new(vec![3, 4]);
+        set_matrix(&mut b, &[1.0, 0.0, 0.0, 0.0,
+                              0.0, 1.0, 0.0, 0.0,
+                              0.0, 0.0, 1.0, 0.0]);
+        let mut c = Tensor::new(vec![4, 2]);
+        set_matrix(&mut c, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+
+        let mut d = Tensor::new(vec![2, 2]);
+        einsum_ary("ab,bc,cd->ad", &[&a, &b, &c], &mut d).unwrap();
+
+        // AB = [[1,2,3,0],[4,5,6,0]], ABC = AB×C = [[1*1+2*3+3*5, 1*2+2*4+3*6],[4*1+5*3+6*5, 4*2+5*4+6*6]]
+        // = [[22, 28],[49, 64]]
+        assert_eq!(d.get(&[0, 0]), 22.0);
+        assert_eq!(d.get(&[0, 1]), 28.0);
+        assert_eq!(d.get(&[1, 0]), 49.0);
+        assert_eq!(d.get(&[1, 1]), 64.0);
+    }
+
+    #[test]
+    fn test_ary_outer_product_three() {
+        // No contraction: a(i) × b(j) × c(k) -> out(i,j,k)
+        let mut a = Tensor::new(vec![2]);
+        set_matrix(&mut a, &[2.0, 3.0]);
+        let mut b = Tensor::new(vec![2]);
+        set_matrix(&mut b, &[5.0, 7.0]);
+        let mut c = Tensor::new(vec![2]);
+        set_matrix(&mut c, &[11.0, 13.0]);
+
+        let mut out = Tensor::new(vec![2, 2, 2]);
+        einsum_ary("a,b,c->abc", &[&a, &b, &c], &mut out).unwrap();
+
+        // out[i,j,k] = a[i]*b[j]*c[k]
+        assert_eq!(out.get(&[0, 0, 0]), 2.0 * 5.0 * 11.0);
+        assert_eq!(out.get(&[0, 0, 1]), 2.0 * 5.0 * 13.0);
+        assert_eq!(out.get(&[0, 1, 0]), 2.0 * 7.0 * 11.0);
+        assert_eq!(out.get(&[1, 1, 1]), 3.0 * 7.0 * 13.0);
+    }
+
+    #[test]
+    fn test_ary_scalar_dot() {
+        // Scalar output via 0-dim tensor: "i,i->" (dot product)
+        let mut a = Tensor::new(vec![4]);
+        let mut b = Tensor::new(vec![4]);
+        set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0]);
+        set_matrix(&mut b, &[5.0, 6.0, 7.0, 8.0]);
+
+        let mut out = Tensor::new(vec![]);  // 0-dim
+        einsum_ary("i,i->", &[&a, &b], &mut out).unwrap();
+
+        assert_eq!(out.get(&[]), 70.0);
+    }
+
+    #[test]
+    fn test_ary_scalar_trace() {
+        // Scalar output via 0-dim tensor: "aa->" (trace)
+        let mut m = Tensor::new(vec![3, 3]);
+        set_matrix(&mut m, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+
+        let mut out = Tensor::new(vec![]);
+        einsum_ary("aa->", &[&m], &mut out).unwrap();
+
+        assert_eq!(out.get(&[]), 15.0);
+    }
+
+    #[test]
+    fn test_ary_scalar_three_input() {
+        // "i,i,i->" — element-wise product summed to scalar
+        let mut a = Tensor::new(vec![3]);
+        let mut b = Tensor::new(vec![3]);
+        let mut c = Tensor::new(vec![3]);
+        set_matrix(&mut a, &[1.0, 2.0, 3.0]);
+        set_matrix(&mut b, &[4.0, 5.0, 6.0]);
+        set_matrix(&mut c, &[7.0, 8.0, 9.0]);
+
+        let mut out = Tensor::new(vec![]);
+        einsum_ary("i,i,i->", &[&a, &b, &c], &mut out).unwrap();
+
+        // 1*4*7 + 2*5*8 + 3*6*9 = 28 + 80 + 162 = 270
+        assert_eq!(out.get(&[]), 270.0);
+    }
+
+    #[test]
+    fn test_ary_row_sum_unary() {
+        let mut a = Tensor::new(vec![2, 3]);
+        set_matrix(&mut a, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let mut out = Tensor::new(vec![2]);
+        einsum_ary("ab->a", &[&a], &mut out).unwrap();
 
         assert_eq!(out.get(&[0]), 6.0);
         assert_eq!(out.get(&[1]), 15.0);

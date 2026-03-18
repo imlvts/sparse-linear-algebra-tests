@@ -1,4 +1,7 @@
-use einsum_dyn::{NDIndex, einsum_binary, einsum_binary_scalar, einsum_unary, einsum_unary_scalar};
+use einsum_dyn::{
+    NDIndex,
+    einsum_binary, einsum_binary_scalar, einsum_unary, einsum_unary_scalar,
+};
 use einsum_pm::einsum_fn;
 use std::time::Instant;
 
