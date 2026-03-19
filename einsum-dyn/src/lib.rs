@@ -287,20 +287,15 @@ pub(crate) fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, Inv
     }
 
     let mut outputs: Vec<Vec<u8>> = Vec::new();
-    if rhs.is_empty() {
-        // Scalar output: single empty group
-        outputs.push(Vec::new());
-    } else {
-        for part in rhs.split(',') {
-            let mut slots = Vec::new();
-            for ch in part.bytes() {
-                if !ch.is_ascii_lowercase() {
-                    return Err(InvalidSpec::InvalidIndex { ch: ch as char });
-                }
-                slots.push(ch - b'a');
+    for part in rhs.split(',') {
+        let mut slots = Vec::new();
+        for ch in part.bytes() {
+            if !ch.is_ascii_lowercase() {
+                return Err(InvalidSpec::InvalidIndex { ch: ch as char });
             }
-            outputs.push(slots);
+            slots.push(ch - b'a');
         }
+        outputs.push(slots);
     }
 
     // Validate: every output index must appear in at least one input
