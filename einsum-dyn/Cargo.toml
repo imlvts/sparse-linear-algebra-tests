@@ -16,3 +16,7 @@ ndarray = "0.16"
 [[bench]]
 name = "einsum_bench"
 harness = false
+
+[[bench]]
+name = "vm_bench"
+harness = false
